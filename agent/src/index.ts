@@ -14,6 +14,7 @@ import {
 } from "@repo/runtime/external-backup-import";
 import { collectAgentWorkPayloadOperationalValues } from "@repo/runtime/logging";
 import { calculateBuildReserve } from "@repo/runtime/server-capacity";
+import { sanitizeWorkerRolloutShutdownFields } from "@repo/runtime/worker-shutdown";
 import agentPackageJson from "../package.json" with { type: "json" };
 import { sendAgentHeartbeat } from "./agent-heartbeat.js";
 import {
@@ -1678,6 +1679,36 @@ function agentProtocolValueHasRedactionConflict(
   }
 }
 
+/**
+ * Sanitizes one protocol field. A rollout's worker shutdown fields are rebuilt from their closed
+ * vocabularies rather than redacted, the same way the control plane reads them, so a customer
+ * variable equal to "SIGTERM" or "previous" cannot turn a finished rollout into a leak.
+ */
+function sanitizeAgentProtocolValue(
+  key: (typeof AGENT_WORK_RESULT_PROTOCOL_KEYS)[number],
+  value: unknown,
+  environmentVariables: EnvironmentVariableMap,
+  operationalValues: readonly string[]
+): unknown {
+  const sanitized = sanitizeSensitiveProtocolValue(value, environmentVariables, operationalValues);
+  if (
+    key !== "rollout" ||
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    typeof sanitized !== "object" ||
+    sanitized === null
+  ) {
+    return sanitized;
+  }
+  return {
+    ...sanitized,
+    ...sanitizeWorkerRolloutShutdownFields(value as Record<string, unknown>, (containerName) =>
+      sanitizeSensitiveProtocolValue(containerName, environmentVariables, operationalValues)
+    ),
+  };
+}
+
 export function sanitizeAgentWorkResult(
   result: Record<string, unknown> | null | undefined,
   environmentVariables: EnvironmentVariableMap,
@@ -1695,7 +1726,8 @@ export function sanitizeAgentWorkResult(
   const safeResult = sanitizedResult as Record<string, unknown>;
   for (const key of AGENT_WORK_RESULT_PROTOCOL_KEYS) {
     if (Object.hasOwn(result, key)) {
-      const sanitizedProtocolValue = sanitizeSensitiveProtocolValue(
+      const sanitizedProtocolValue = sanitizeAgentProtocolValue(
+        key,
         result[key],
         environmentVariables,
         operationalValues
@@ -3540,10 +3572,17 @@ async function handleBuildAndDeployWorker(
       platformGeneratedValues: payload.platformGeneratedValues ?? [],
       ...(onBuildLog ? { onBuildLog } : {}),
     });
-    const result = await deployWorkerRuntime(docker, getWorkerRuntimeEnvironment(config), {
-      ...payload,
-      imageUrl: buildResult.imageUrl,
-    });
+    const result = await deployWorkerRuntime(
+      docker,
+      getWorkerRuntimeEnvironment(config),
+      { ...payload, imageUrl: buildResult.imageUrl },
+      onBuildLog
+        ? {
+            onProgress: (line) =>
+              onBuildLog({ type: "stdout", line: `[rollout] ${line}`, timestamp: Date.now() }),
+          }
+        : {}
+    );
     return {
       ...result,
       buildDuration: buildResult.buildDuration,
@@ -5845,7 +5884,11 @@ async function processWorkItem(
             });
             break;
           case "restart_worker":
-            result = await restartWorkerServiceRuntime(docker, String(payload.serviceId));
+            result = await restartWorkerServiceRuntime(docker, {
+              serviceId: String(payload.serviceId),
+              runtimeMetadata: toRuntimeMetadata(payload.runtimeMetadata),
+              shutdownPolicy: payload.shutdownPolicy,
+            });
             break;
           case "remove_app":
             result = await handleRemove(

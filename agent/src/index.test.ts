@@ -660,6 +660,42 @@ describe("agent work mutation errors", () => {
     ).toThrow("Agent work result conflicts with protected environment material");
   });
 
+  test("keeps a worker rollout's shutdown vocabulary when a customer value equals it", () => {
+    const shutdown = {
+      containerName: "nouva-worker-svc_1-dep_1-0",
+      role: "previous",
+      signal: "SIGTERM",
+      gracePeriodSeconds: 30,
+      outcome: "forced",
+      exitCode: 137,
+      elapsedMs: 30_000,
+    };
+    const rollout = {
+      strategy: "candidate_ready_cutover",
+      outcome: "committed",
+      liveRuntimePreserved: false,
+      rollbackCompleted: false,
+      policy: { signal: "SIGTERM", gracePeriodSeconds: 30, rolloutPolicy: "overlap" },
+      shutdowns: [shutdown],
+    };
+    const customerVariables = {
+      STOP_SIGNAL: "SIGTERM",
+      QUEUE_MODE: "overlap",
+      NODE_ROLE: "previous",
+      LAST_RESULT: "forced",
+    };
+
+    expect(sanitizeAgentWorkResult({ rollout }, customerVariables)).toEqual({ rollout });
+
+    const secret = "sentinel-private-value";
+    expect(() =>
+      sanitizeAgentWorkResult(
+        { rollout: { ...rollout, shutdowns: [{ ...shutdown, containerName: `nouva-${secret}` }] } },
+        { ...customerVariables, SENTINEL_PRIVATE_NAME: secret }
+      )
+    ).toThrow("Agent work result conflicts with protected environment material");
+  });
+
   test("drops an ambiguous failure result instead of leaking or corrupting identifiers", () => {
     const secret = "sentinel-private-value";
 

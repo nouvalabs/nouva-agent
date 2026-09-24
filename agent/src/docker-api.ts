@@ -89,6 +89,7 @@ export interface DockerContainerInspection {
     Cmd?: string[];
     Env?: string[];
     Labels?: Record<string, string>;
+    StopSignal?: string;
   };
   NetworkSettings?: {
     Networks?: Record<
@@ -162,6 +163,10 @@ export interface DockerContainerSpec {
     StartPeriod?: number;
   };
   exposedPorts?: Record<string, Record<string, never>>;
+  /** Signal Docker sends on `docker stop`, a daemon shutdown or a restart. */
+  stopSignal?: string;
+  /** Seconds Docker waits after `stopSignal` before it sends SIGKILL. */
+  stopTimeoutSeconds?: number;
   hostConfig?: Record<string, unknown>;
   networkingConfig?: Record<string, unknown>;
 }
@@ -776,6 +781,40 @@ export class DockerApiClient {
     }
   }
 
+  /**
+   * Sends `signal` to the container's main process. Returns `false` when there was nothing to
+   * signal: the container is gone (404) or no longer running (409), which a caller waiting for the
+   * process to stop reads as the same outcome.
+   */
+  async killContainer(nameOrId: string, signal: string): Promise<boolean> {
+    try {
+      await this.request(
+        "POST",
+        `/containers/${encodeURIComponent(nameOrId)}/kill?signal=${encodeURIComponent(signal)}`
+      );
+      return true;
+    } catch (error) {
+      if (error instanceof DockerApiError && (error.status === 404 || error.status === 409)) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Changes only the restart policy. A worker being retired is switched to `no` first so the
+   * daemon cannot restart a process that exits on the retirement signal, and switched back to
+   * `unless-stopped` if the rollout has to restore it.
+   */
+  async updateContainerRestartPolicy(
+    nameOrId: string,
+    policy: "no" | "unless-stopped"
+  ): Promise<void> {
+    await this.request("POST", `/containers/${encodeURIComponent(nameOrId)}/update`, {
+      RestartPolicy: { Name: policy },
+    });
+  }
+
   async restartContainer(nameOrId: string): Promise<void> {
     await this.request("POST", `/containers/${encodeURIComponent(nameOrId)}/restart`);
   }
@@ -793,6 +832,8 @@ export class DockerApiClient {
         Labels: spec.labels,
         Healthcheck: spec.healthcheck,
         ExposedPorts: spec.exposedPorts,
+        StopSignal: spec.stopSignal,
+        StopTimeout: spec.stopTimeoutSeconds,
         HostConfig: withManagedContainerLogConfig(spec),
         NetworkingConfig: spec.networkingConfig,
       }

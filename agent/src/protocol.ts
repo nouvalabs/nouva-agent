@@ -311,6 +311,7 @@ export type AgentCapabilities = {
   workerVolumeRolloutV1?: boolean;
   externalBackupImportV1?: boolean;
   postgresRepositoryLineageV1?: boolean;
+  workerShutdownPolicyV1?: boolean;
   [key: string]: boolean | undefined;
 };
 
@@ -599,6 +600,12 @@ export interface WorkerDeployPayload {
   startCommand: string | null;
   healthCheckCommand: string | null;
   replicaCount: number;
+  /**
+   * The worker's shutdown signal, grace period and rollout policy (#284), unvalidated as it came
+   * off the wire. The worker runtime parses it and falls back to the default policy when a control
+   * plane older than the field leaves it out.
+   */
+  shutdownPolicy?: unknown;
   volume?: AppVolumeIdentity | null;
   resourceLimits: EffectiveServiceResourceLimits;
   runtimeMetadata?: RuntimeMetadata | null;
@@ -619,6 +626,8 @@ export interface WorkerDeployOnlyPayload {
   startCommand: string | null;
   healthCheckCommand: string | null;
   replicaCount: number;
+  /** See `WorkerDeployPayload.shutdownPolicy`. */
+  shutdownPolicy?: unknown;
   volume?: AppVolumeIdentity | null;
   resourceLimits: EffectiveServiceResourceLimits;
   runtimeMetadata?: RuntimeMetadata | null;
@@ -961,6 +970,9 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     // completion report resumes instead of erasing the freshly initialized cluster. The control
     // plane refuses to rotate a PostgreSQL repository without it.
     postgresRepositoryLineageV1: true,
+    // Declares that a worker rollout honors the service's shutdown signal, grace period and
+    // overlap policy, and never force-removes the previous process as normal retirement (#284).
+    workerShutdownPolicyV1: true,
   };
 }
 
