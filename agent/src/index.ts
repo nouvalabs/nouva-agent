@@ -219,9 +219,7 @@ const BUILDKIT_STATE_PATH = "/var/lib/buildkit";
 const BUILDKIT_GC_KEEP_STORAGE =
   process.env.NOUVA_AGENT_BUILDKIT_GC_KEEP_STORAGE || "1000,4000,8000";
 const DEFAULT_AGENT_CONTAINER_NAME = "nouva-agent";
-// The nouvalabs package only becomes pullable once its first release is published and made
-// public; the frozen nouvacloud image still pulls, and a new agent updates from there.
-const DEFAULT_AGENT_IMAGE = "ghcr.io/nouvacloud/nouva-agent:latest";
+const DEFAULT_AGENT_IMAGE = "ghcr.io/nouvalabs/nouva-agent:latest";
 const APP_VOLUME_SNAPSHOT_IMAGE = "alpine:3.21";
 
 function ensureTraefikRuntimeSerialized(
