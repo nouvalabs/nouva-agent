@@ -4,31 +4,31 @@ import { resolveUpdateAgentImageRef, toUpdateAgentPayload } from "./update-agent
 describe("update agent payload compatibility", () => {
   test("accepts the legacy imageTag payload", () => {
     const payload = toUpdateAgentPayload({
-      imageTag: "ghcr.io/nouvacloud/nouva-agent:v0.2.0",
+      imageTag: "ghcr.io/nouvalabs/nouva-agent:v0.2.0",
     });
 
     expect(payload).toEqual({
-      imageTag: "ghcr.io/nouvacloud/nouva-agent:v0.2.0",
+      imageTag: "ghcr.io/nouvalabs/nouva-agent:v0.2.0",
     });
-    expect(resolveUpdateAgentImageRef(payload)).toBe("ghcr.io/nouvacloud/nouva-agent:v0.2.0");
+    expect(resolveUpdateAgentImageRef(payload)).toBe("ghcr.io/nouvalabs/nouva-agent:v0.2.0");
   });
 
   test("prefers imageRef for digest-pinned rollout payloads", () => {
     const payload = toUpdateAgentPayload({
       releaseId: "rel_123",
       version: "v0.2.0",
-      imageRef: "ghcr.io/nouvacloud/nouva-agent@sha256:deadbeef",
-      imageTag: "ghcr.io/nouvacloud/nouva-agent:v0.2.0",
+      imageRef: "ghcr.io/nouvalabs/nouva-agent@sha256:deadbeef",
+      imageTag: "ghcr.io/nouvalabs/nouva-agent:v0.2.0",
     });
 
     expect(payload).toEqual({
       releaseId: "rel_123",
       version: "v0.2.0",
-      imageRef: "ghcr.io/nouvacloud/nouva-agent@sha256:deadbeef",
-      imageTag: "ghcr.io/nouvacloud/nouva-agent:v0.2.0",
+      imageRef: "ghcr.io/nouvalabs/nouva-agent@sha256:deadbeef",
+      imageTag: "ghcr.io/nouvalabs/nouva-agent:v0.2.0",
     });
     expect(resolveUpdateAgentImageRef(payload)).toBe(
-      "ghcr.io/nouvacloud/nouva-agent@sha256:deadbeef"
+      "ghcr.io/nouvalabs/nouva-agent@sha256:deadbeef"
     );
   });
 

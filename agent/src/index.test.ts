@@ -476,12 +476,12 @@ describe("agent version reporting", () => {
         NOUVA_API_URL: "https://api.nouvacloud.com",
         NOUVA_SERVER_ID: "srv_1",
         NOUVA_AGENT_DATA_VOLUME: "nouva-agent-data",
-        NOUVA_AGENT_IMAGE: "ghcr.io/nouvacloud/nouva-agent:v0.1.0",
-        NOUVA_AGENT_TARGET_IMAGE: "ghcr.io/nouvacloud/nouva-agent:v0.1.0",
+        NOUVA_AGENT_IMAGE: "ghcr.io/nouvalabs/nouva-agent:v0.1.0",
+        NOUVA_AGENT_TARGET_IMAGE: "ghcr.io/nouvalabs/nouva-agent:v0.1.0",
         NOUVA_AGENT_VERSION: "v0.1.0",
         PATH: "/usr/bin",
       },
-      "ghcr.io/nouvacloud/nouva-agent:latest"
+      "ghcr.io/nouvalabs/nouva-agent:latest"
     );
 
     expect(result).toEqual({
@@ -489,8 +489,8 @@ describe("agent version reporting", () => {
         "NOUVA_AGENT_DATA_VOLUME=nouva-agent-data",
         "NOUVA_API_URL=https://api.nouvacloud.com",
         "NOUVA_SERVER_ID=srv_1",
-        "NOUVA_AGENT_IMAGE=ghcr.io/nouvacloud/nouva-agent:latest",
-        "NOUVA_AGENT_TARGET_IMAGE=ghcr.io/nouvacloud/nouva-agent:latest",
+        "NOUVA_AGENT_IMAGE=ghcr.io/nouvalabs/nouva-agent:latest",
+        "NOUVA_AGENT_TARGET_IMAGE=ghcr.io/nouvalabs/nouva-agent:latest",
       ],
       envInheritFlags:
         "-e NOUVA_AGENT_DATA_VOLUME -e NOUVA_API_URL -e NOUVA_SERVER_ID -e NOUVA_AGENT_IMAGE -e NOUVA_AGENT_TARGET_IMAGE",
@@ -563,14 +563,14 @@ describe("resolveAgentTaskImage", () => {
         ? {
             Id: "ctr_agent_1",
             Config: {
-              Image: "ghcr.io/nouvacloud/nouva-agent:v0.4.10",
+              Image: "ghcr.io/nouvalabs/nouva-agent:v0.4.10",
             },
           }
         : null
     );
 
     await expect(resolveAgentTaskImage(docker as never)).resolves.toBe(
-      "ghcr.io/nouvacloud/nouva-agent:v0.4.10"
+      "ghcr.io/nouvalabs/nouva-agent:v0.4.10"
     );
   });
 });

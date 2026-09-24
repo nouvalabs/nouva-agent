@@ -169,7 +169,7 @@ describe("clock synchronisation detection", () => {
     chronydSocket = await listenOnChronydSocket(hostRoot);
 
     const evidence = await detectHostClockSync(
-      availableHelper(docker, "ghcr.io/nouvacloud/nouva-agent:0.4.24"),
+      availableHelper(docker, "ghcr.io/nouvalabs/nouva-agent:0.4.24"),
       { hostRoot, labels: { "nouva.kind": "clock-probe" } }
     );
 
@@ -188,7 +188,7 @@ describe("clock synchronisation detection", () => {
       hostConfig?: Record<string, unknown>;
     };
     expect(spec.name).toBe(CLOCK_PROBE_CONTAINER_NAME);
-    expect(spec.image).toBe("ghcr.io/nouvacloud/nouva-agent:0.4.24");
+    expect(spec.image).toBe("ghcr.io/nouvalabs/nouva-agent:0.4.24");
     expect(spec.entrypoint).toEqual(["nsenter"]);
     expect(spec.cmd?.slice(0, 9)).toEqual(["-t", "1", "-m", "-u", "-i", "-n", "--", "sh", "-c"]);
     expect(spec.cmd?.[9]).toBe(buildClockProbeScript());
@@ -275,7 +275,7 @@ describe("clock synchronisation detection", () => {
   test("should name why the probe could not run instead of a generic reason", async () => {
     const docker = createDockerMock();
     // What resolveAgentTaskImage throws when the pinned agent image is not present locally.
-    const imageFailure = 'No such image: ghcr.io/nouvacloud/nouva-agent:0.4.24"';
+    const imageFailure = 'No such image: ghcr.io/nouvalabs/nouva-agent:0.4.24"';
 
     const bare = await detectHostClockSync(
       { kind: "unavailable", reason: imageFailure },

@@ -91,7 +91,7 @@ describe("host tuning", () => {
     });
 
     const result = await ensureHostKernelSettings(docker, {
-      image: "ghcr.io/nouvacloud/nouva-agent:0.4.19",
+      image: "ghcr.io/nouvalabs/nouva-agent:0.4.19",
       hostRoot,
       labels: { "nouva.kind": "host-tuning" },
     });
@@ -110,7 +110,7 @@ describe("host tuning", () => {
       hostConfig?: Record<string, unknown>;
     };
     expect(spec.name).toBe(HOST_TUNING_CONTAINER_NAME);
-    expect(spec.image).toBe("ghcr.io/nouvacloud/nouva-agent:0.4.19");
+    expect(spec.image).toBe("ghcr.io/nouvalabs/nouva-agent:0.4.19");
     expect(spec.entrypoint).toEqual(["nsenter"]);
     expect(spec.cmd?.slice(0, 9)).toEqual(["-t", "1", "-m", "-u", "-i", "-n", "--", "sh", "-c"]);
     expect(spec.cmd?.[9]).toBe(buildHostSysctlScript());

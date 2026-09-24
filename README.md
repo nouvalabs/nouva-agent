@@ -1,8 +1,8 @@
 # Nouva Agent
 
-[![CI](https://github.com/nouvacloud/nouva-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/nouvacloud/nouva-agent/actions/workflows/ci.yml)
+[![CI](https://github.com/nouvalabs/nouva-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/nouvalabs/nouva-agent/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Docker Image](https://img.shields.io/badge/ghcr.io-nouvacloud%2Fnouva--agent-blue)](https://ghcr.io/nouvacloud/nouva-agent)
+[![Docker Image](https://img.shields.io/badge/ghcr.io-nouvalabs%2Fnouva--agent-blue)](https://ghcr.io/nouvalabs/nouva-agent)
 
 > This repository is an automatically mirrored public release surface.
 > The writable source of truth for `nouva-agent` lives in the Nouva Cloud monorepo.
@@ -11,7 +11,7 @@
 A containerized edge agent that runs on your infrastructure to execute deployment and service management tasks on behalf of [Nouva Cloud](https://nouvacloud.com). It communicates with the Nouva control plane to lease work, process it locally via Docker, and report results back.
 
 Production container images are published only from a published GitHub Release in this repository.
-Merges to `main` and plain tag pushes do not publish `ghcr.io/nouvacloud/nouva-agent`. See
+Merges to `main` and plain tag pushes do not publish `ghcr.io/nouvalabs/nouva-agent`. See
 [docs/releasing.md](docs/releasing.md) for the release flow.
 
 ## Features
@@ -34,7 +34,7 @@ Merges to `main` and plain tag pushes do not publish `ghcr.io/nouvacloud/nouva-a
 
 ```bash
 # Clone and install
-git clone https://github.com/nouvacloud/nouva-agent.git
+git clone https://github.com/nouvalabs/nouva-agent.git
 cd nouva-agent
 bun install
 

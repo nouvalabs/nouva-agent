@@ -30,7 +30,7 @@ jobs:
       id-token: write
       packages: write
     env:
-      IMAGE_NAME: ghcr.io/nouvacloud/nouva-agent
+      IMAGE_NAME: ghcr.io/nouvalabs/nouva-agent
       RELEASE_SHA: ${{ inputs.sha || github.sha }}
       RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
     steps:
@@ -143,7 +143,7 @@ jobs:
             ${{ env.IMAGE_NAME }}:${{ env.RELEASE_SHA }}
             ${{ env.IMAGE_NAME }}:latest
           labels: |
-            org.opencontainers.image.source=https://github.com/nouvacloud/nouva-agent
+            org.opencontainers.image.source=https://github.com/nouvalabs/nouva-agent
             org.opencontainers.image.revision=${{ env.RELEASE_SHA }}
             org.opencontainers.image.version=${{ env.RELEASE_TAG }}
             org.opencontainers.image.licenses=Apache-2.0
@@ -153,6 +153,30 @@ jobs:
 
       - name: Sign image
         run: cosign sign --yes "${IMAGE_NAME}@${{ steps.docker.outputs.digest }}"
+
+      # Customer servers pull without credentials, and the control plane starts rolling a release out
+      # as soon as it is notified. GHCR creates a new package private, so stop here, before the control
+      # plane is notified (and, for a dispatched draft, before it is published), until the package has
+      # been made public; then re-run this job.
+      - name: Check the image is publicly pullable
+        env:
+          IMAGE_DIGEST: ${{ steps.docker.outputs.digest }}
+        run: |
+          repository="${IMAGE_NAME#ghcr.io/}"
+          # A private package is refused an anonymous token, so an empty token is expected there;
+          # the manifest request below is what decides.
+          token="$(curl -fsS "https://ghcr.io/token?scope=repository:${repository}:pull" | jq -r '.token // empty' || true)"
+          if [ -z "${token}" ]; then
+            echo "::warning::GHCR issued no anonymous pull token for ${repository}: the package is private, or GHCR is unreachable."
+          fi
+          status="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            "https://ghcr.io/v2/${repository}/manifests/${IMAGE_DIGEST}")"
+          if [ "${status}" != "200" ]; then
+            echo "::error::${IMAGE_NAME}@${IMAGE_DIGEST} is not anonymously pullable (HTTP ${status}). If the package is private, make it public; if GHCR was unavailable, retry. Then re-run this job."
+            exit 1
+          fi
 
       - name: Publish automated GitHub release
         if: >-

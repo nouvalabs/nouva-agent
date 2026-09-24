@@ -69,7 +69,7 @@ COPY agent ./agent
 COPY packages/runtime ./packages/runtime
 
 ARG VCS_REF=local
-LABEL org.opencontainers.image.source="https://github.com/nouvacloud/nouva-agent"
+LABEL org.opencontainers.image.source="https://github.com/nouvalabs/nouva-agent"
 LABEL org.opencontainers.image.revision="${VCS_REF}"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 

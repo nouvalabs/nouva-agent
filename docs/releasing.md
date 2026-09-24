@@ -22,7 +22,7 @@ availability, not ordering or permission to publish `latest`.
 Dispatch it before merging, selecting the candidate branch and a base branch, tag or SHA:
 
 ```sh
-gh workflow run agent-release-readiness.yml --repo nouvacloud/nouva-platform \
+gh workflow run agent-release-readiness.yml --repo nouvalabs/nouva-platform \
   --ref <candidate-branch> -f base_ref=main
 ```
 
@@ -34,7 +34,7 @@ Lookup failures fail closed; sync remains the authoritative pre-mutation check.
 **Sync Agent Public Repo** repeats the check against the actual public mirror before replacing,
 committing or pushing any content. For changed exports it also lists GitHub releases using the
 existing `NOUVA_AGENT_MIRROR_TOKEN`, including untagged draft reservations. That token must have
-repository contents read/write (push) permission on `nouvacloud/nouva-agent` to see drafts; a
+repository contents read/write (push) permission on `nouvalabs/nouva-agent` to see drafts; a
 read-only or incorrectly scoped token cannot establish draft availability. HTTP failures (including
 404), malformed responses, network errors, or incomplete pagination fail closed. Listing is bounded
 to ten pages of 100 releases and 30 seconds; hitting the bound requires investigation, not a bypass.
@@ -45,17 +45,14 @@ rerun the check. Never move a published tag or bump only the mirror. An existing
 its version; retry its exact original release workflow rather than syncing different content under
 that tag. Availability must be rechecked before publication because neither gate reserves a version.
 
-Local preparation for graceful worker rollouts uses `0.4.37`, which retires a worker's previous
-process with its configured signal and grace period instead of force-removing it, can confirm the
-old process stopped before the new one starts, and reports every shutdown outcome in the rollout
-result. Version availability for `v0.4.37` has not been checked during this preparation; run the
-readiness check and the sync gate before publishing. Neither a local bump nor a green check is
-evidence of a published image or an upgraded server.
-
-Local preparation for release jobs and verification uses `0.4.38`, which runs a deployment's
-pre-activation job before cutover and its verification job after, under a claim the control plane
-records. The control plane holds deployments with release phases until a server reports this
-agent. Version availability for `v0.4.38` has not been checked during this preparation either.
+`0.4.39` is the first release under `ghcr.io/nouvalabs/nouva-agent`. It carries graceful worker
+rollouts, which retire a worker's previous process with its configured signal and grace period and
+report every shutdown outcome in the rollout result, and release jobs and verification, which run a
+deployment's pre-activation job before cutover and its verification job after, under a claim the
+control plane records. The control plane holds deployments with release phases until a server
+reports this agent. `v0.4.37` and `v0.4.38` were never published: both stopped at the image push
+after the GitHub organization moved to nouvalabs, and their drafts reserve those tags. Neither a
+local bump nor a green check is evidence of a published image or an upgraded server.
 
 ## Manual validation and runners
 
@@ -64,8 +61,8 @@ manual dispatch. Deployment, runtime-image publication, mirror sync, agent relea
 monitoring retain their automation. To run broader checks independently:
 
 ```sh
-gh workflow run control-plane-ci.yml --repo nouvacloud/nouva-platform --ref <candidate-branch>
-gh workflow run ci.yml --repo nouvacloud/nouva-agent --ref <public-branch>
+gh workflow run control-plane-ci.yml --repo nouvalabs/nouva-platform --ref <candidate-branch>
+gh workflow run ci.yml --repo nouvalabs/nouva-agent --ref <public-branch>
 ```
 
 Linux workflow jobs use Blacksmith (`blacksmith-2vcpu-ubuntu-2404`, with existing native ARM jobs on
@@ -105,26 +102,30 @@ tags that do not match `v${agent/package.json version}`.
 
 After the workflow finishes, confirm it published all expected tags:
 
-- `ghcr.io/nouvacloud/nouva-agent:v0.1.0`
-- `ghcr.io/nouvacloud/nouva-agent:<release-commit-sha>`
-- `ghcr.io/nouvacloud/nouva-agent:latest`
+- `ghcr.io/nouvalabs/nouva-agent:v0.1.0`
+- `ghcr.io/nouvalabs/nouva-agent:<release-commit-sha>`
+- `ghcr.io/nouvalabs/nouva-agent:latest`
 
 Then verify the control-plane notification step succeeded. The webhook payload remains:
 
 ```json
 {
   "version": "v0.1.0",
-  "imageRef": "ghcr.io/nouvacloud/nouva-agent@sha256:...",
+  "imageRef": "ghcr.io/nouvalabs/nouva-agent@sha256:...",
   "digest": "sha256:...",
   "gitSha": "<release-commit-sha>",
   "githubReleaseId": "<github-release-id>",
-  "githubReleaseUrl": "https://github.com/nouvacloud/nouva-agent/releases/tag/v0.1.0",
+  "githubReleaseUrl": "https://github.com/nouvalabs/nouva-agent/releases/tag/v0.1.0",
   "publishedAt": "<timestamp>"
 }
 ```
 
 ## GHCR visibility
 
-After the first successful publish, inspect the GitHub Packages entry for
-`ghcr.io/nouvacloud/nouva-agent`. If GitHub created the package with private visibility, change it
-to `public` so unauthenticated installs can pull both `v0.1.0` and `latest`.
+The release job checks that the pushed digest is anonymously pullable before it notifies the
+control plane (and, for a dispatched draft, before it publishes the GitHub release). Publish the
+first release under a new namespace through the draft dispatch path: a release published by hand is
+already public when the job starts. The first push under a new namespace creates the
+`ghcr.io/nouvalabs/nouva-agent` package with private visibility, so that job fails at "Check the
+image is publicly pullable": change the package to `public` (and link it to this repository), then
+re-run the job.
