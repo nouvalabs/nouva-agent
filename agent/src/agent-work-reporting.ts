@@ -19,6 +19,12 @@ export type AgentTerminalReport =
   | { kind: "fail"; result: Record<string, unknown> | null; errorMessage: string };
 
 /**
+ * How prepared work ended: a terminal report to send, or `released` when the control plane already
+ * took the work back (it requeued it under the same lease), so there is nothing left to report.
+ */
+export type AgentWorkOutcome = AgentTerminalReport | { kind: "released"; reason: string };
+
+/**
  * Runs prepare once and keeps its lease until reporting ends, including failures. prepare and
  * rejectResult supply already-sanitized reports; send must bound each request's duration.
  * Transient reports get four attempts. A lost completion reply never authorizes runtime rollback,
@@ -27,7 +33,7 @@ export type AgentTerminalReport =
  */
 export async function executeAndReportAgentWork(input: {
   work: { id: string; kind: string };
-  prepare: () => Promise<AgentTerminalReport>;
+  prepare: () => Promise<AgentWorkOutcome>;
   send: (report: AgentTerminalReport) => Promise<void>;
   rejectResult: (error: ApiRequestError) => Promise<AgentTerminalReport>;
   stopLease: () => Promise<void>;
@@ -58,7 +64,12 @@ export async function executeAndReportAgentWork(input: {
     }
   };
   try {
-    let report = await input.prepare();
+    const outcome = await input.prepare();
+    if (outcome.kind === "released") {
+      log(`${prefix} returned to the queue: ${outcome.reason}`);
+      return;
+    }
+    let report: AgentTerminalReport = outcome;
     if (report.kind === "fail") log(`${prefix} failed: ${report.errorMessage}`);
     try {
       await sendWithRetry(report);

@@ -7,6 +7,7 @@
     "./agent-metrics": "./src/agent-metrics.ts",
     "./external-backup-import": "./src/external-backup-import.ts",
     "./logging": "./src/logging.ts",
+    "./release-phases": "./src/release-phases.ts",
     "./server-capacity": "./src/server-capacity.ts",
     "./worker-shutdown": "./src/worker-shutdown.ts"
   }

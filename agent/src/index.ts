@@ -13,6 +13,12 @@ import {
   verifyExternalBackupArtifact,
 } from "@repo/runtime/external-backup-import";
 import { collectAgentWorkPayloadOperationalValues } from "@repo/runtime/logging";
+import {
+  decideVerificationConsequence,
+  type ReleaseJobClaimRequest,
+  type ReleaseJobClaimResponse,
+  type ReleaseJobOutcome,
+} from "@repo/runtime/release-phases";
 import { calculateBuildReserve } from "@repo/runtime/server-capacity";
 import { sanitizeWorkerRolloutShutdownFields } from "@repo/runtime/worker-shutdown";
 import agentPackageJson from "../package.json" with { type: "json" };
@@ -65,6 +71,7 @@ import {
 } from "./docker-api.js";
 import {
   assertAppliedDockerResourceSettings,
+  type DockerResourceSettings,
   toDockerResourceSettings,
 } from "./docker-resource-limits.js";
 import { ensureHostKernelSettings, HOST_INOTIFY_MAX_USER_WATCHES } from "./host-tuning.js";
@@ -118,6 +125,17 @@ import {
   type WorkerJobPayload,
 } from "./protocol.js";
 import {
+  createReleasePhaseRunner,
+  type ReleaseJobControlPlane,
+  ReleaseJobDeferredError,
+  ReleaseJobHaltError,
+  type ReleaseJobTarget,
+  type ReleasePhaseRequest,
+  type ReleasePhaseResult,
+  type ReleasePhaseRunner,
+} from "./release-jobs.js";
+import {
+  createBuildLogRedactor,
   type EnvironmentVariableMap,
   redactSensitiveText,
   sanitizeSensitiveProtocolValue,
@@ -3057,11 +3075,211 @@ async function appCandidateMountsMatch(
   return true;
 }
 
+/**
+ * Runs the pre-activation phase, which comes before anything live is touched. However it stops —
+ * the job did not succeed, or Docker or the control plane failed under it — the error carries
+ * `rollout`, so the failure is recorded without marking the deployment still serving as failed.
+ * A deferral passes through as it is: the work goes back to the queue rather than failing.
+ */
+export async function runPreActivation(
+  releasePhases: ReleasePhaseRunner,
+  target: ReleaseJobTarget,
+  request: ReleasePhaseRequest,
+  rollout: AppRolloutResult | { liveRuntimePreserved: boolean }
+): Promise<void> {
+  let result: ReleasePhaseResult;
+  try {
+    result = await releasePhases.run(target, request);
+  } catch (error) {
+    if (error instanceof ReleaseJobDeferredError) {
+      throw error;
+    }
+    throw new ReleaseJobHaltError(
+      error instanceof Error ? error.message : "The pre-activation job could not be run",
+      rollout
+    );
+  }
+  if (result.kind === "unsuccessful") {
+    throw new ReleaseJobHaltError(result.message, rollout);
+  }
+}
+
+/**
+ * A verification that could not be carried through — Docker or the control plane failed under it —
+ * has an unknown outcome, and an unknown outcome keeps the new deployment. Failing the work instead
+ * would roll traffic back over something nobody observed. The attempt stays `running` in the
+ * control plane, which settles it as unknown when the deployment completes.
+ */
+async function runVerificationKeepingOnError(
+  releasePhases: ReleasePhaseRunner,
+  target: ReleaseJobTarget,
+  request: ReleasePhaseRequest
+): Promise<ReleasePhaseResult | { kind: "interrupted" }> {
+  try {
+    return await releasePhases.run(target, request);
+  } catch (error) {
+    console.error(
+      `[nouva-agent] verification of deployment ${target.deploymentId} was interrupted; keeping it`,
+      target.redactLogLine(error instanceof Error ? error.message : "unknown error")
+    );
+    return { kind: "interrupted" };
+  }
+}
+
+/**
+ * Whether the previous app container could take traffic back right now, judged by the same
+ * readiness check a candidate must pass before cutover.
+ */
+async function previousAppRuntimeCanServe(
+  dependencies: Pick<DeployAppImageDependencies, "checkTcpConnect">,
+  docker: Pick<DockerApiClient, "inspectContainer">,
+  containerName: string,
+  appPort: number,
+  rollout: AppRolloutConfig
+): Promise<boolean> {
+  try {
+    await waitForAppCandidateReadiness(dependencies, docker, containerName, appPort, rollout);
+    return true;
+  } catch (error) {
+    // Not serving is the answer, not a failure: the new deployment keeps the traffic instead.
+    console.warn(
+      `[nouva-agent] previous container ${containerName} cannot take traffic back`,
+      error instanceof Error ? error.message : error
+    );
+    return false;
+  }
+}
+
+/** Points the service's route at `serviceUrl`; whether Traefik confirmed it serves from there. */
+async function moveAppTraffic(
+  dependencies: Pick<DeployAppImageDependencies, "fetchImpl" | "writeLocalTraefikRoute">,
+  serviceId: string,
+  hostnames: { providedHostname: string; customHostnames: string[] },
+  serviceUrl: string,
+  rollout: AppRolloutConfig
+): Promise<boolean> {
+  try {
+    await dependencies.writeLocalTraefikRoute(TRAEFIK_PATHS, serviceId, hostnames, serviceUrl);
+    await waitForLocalTraefikCutover(dependencies.fetchImpl, serviceId, serviceUrl, rollout);
+    return true;
+  } catch (error) {
+    // Reported as a boolean: the caller decides which release keeps the traffic instead.
+    console.warn(
+      `[nouva-agent] could not move traffic of service ${serviceId} to ${serviceUrl}`,
+      error instanceof Error ? error.message : error
+    );
+    return false;
+  }
+}
+
+/**
+ * Finishes the rollback an earlier run of this deployment reported after its verification failed:
+ * only that run's final report was lost, and it may have stopped anywhere between reporting and
+ * removing its candidate. Traffic goes to the previous deployment and a still running candidate is
+ * removed, so the release is never served again. Whether the candidate is alive says nothing about
+ * why, so the previous deployment is probed directly. When it cannot serve, or traffic cannot be
+ * moved to it, `false` leaves the deploy to go ahead and keep the new release, as the earlier run
+ * would have.
+ */
+async function returnTrafficFromRejectedRelease(
+  dependencies: Pick<
+    DeployAppImageDependencies,
+    "checkTcpConnect" | "fetchImpl" | "writeLocalTraefikRoute"
+  >,
+  docker: Pick<DockerApiClient, "inspectContainer" | "removeContainer">,
+  input: {
+    serviceId: string;
+    hostnames: { providedHostname: string; customHostnames: string[] };
+    previousContainer: string;
+    previousServiceUrl: string;
+    previousPort: number;
+    candidateContainerName: string | null;
+    rollout: AppRolloutConfig;
+  }
+): Promise<boolean> {
+  const previousCanServe = await previousAppRuntimeCanServe(
+    dependencies,
+    docker,
+    input.previousContainer,
+    input.previousPort,
+    input.rollout
+  );
+  if (
+    !previousCanServe ||
+    !(await moveAppTraffic(
+      dependencies,
+      input.serviceId,
+      input.hostnames,
+      input.previousServiceUrl,
+      input.rollout
+    ))
+  ) {
+    return false;
+  }
+  if (input.candidateContainerName) {
+    try {
+      await docker.removeContainer(input.candidateContainerName, true);
+    } catch (error) {
+      // Traffic has already left it; an idle container is left for a later sweep rather than
+      // letting the rejected release go ahead.
+      console.warn(
+        `[nouva-agent] could not remove rejected candidate ${input.candidateContainerName}`,
+        error instanceof Error ? error.message : error
+      );
+    }
+  }
+  return true;
+}
+
+/** The one-off container a release phase of this deployment runs in; see `release-jobs.ts`. */
+function buildReleaseJobTarget(
+  docker: Pick<DockerApiClient, "inspectImage" | "pullImage">,
+  input: {
+    projectId: string;
+    environmentId?: string | null;
+    serviceId: string;
+    deploymentId: string;
+    redactionContextVersion?: string;
+    image: string;
+    pullImage: boolean;
+    envVars: Record<string, string>;
+    platformGeneratedValues?: readonly string[];
+    resourceSettings: DockerResourceSettings;
+  }
+): ReleaseJobTarget {
+  return {
+    serviceId: input.serviceId,
+    deploymentId: input.deploymentId,
+    image: input.image,
+    networkName: buildProjectNetwork(input.projectId),
+    envVars: input.envVars,
+    labels: buildLabels({
+      kind: "release_job",
+      projectId: input.projectId,
+      environmentId: input.environmentId ?? null,
+      serviceId: input.serviceId,
+      deploymentId: input.deploymentId,
+      redactionContextVersion: input.redactionContextVersion,
+    }),
+    resourceSettings: input.resourceSettings,
+    redactLogLine: createBuildLogRedactor(input.envVars, input.platformGeneratedValues ?? []),
+    prepareImage: async () => {
+      if (!(await docker.inspectImage(input.image))) {
+        if (!input.pullImage) {
+          throw new Error(`Docker image ${input.image} is not present locally`);
+        }
+        await docker.pullImage(input.image);
+      }
+    },
+  };
+}
+
 export async function deployAppImageWithDependencies(
   dependencies: DeployAppImageDependencies,
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
-  payload: DeployAppImageInput
+  payload: DeployAppImageInput,
+  releasePhases?: ReleasePhaseRunner
 ) {
   await dependencies.ensureBaseRuntime(docker, config);
 
@@ -3137,6 +3355,71 @@ export async function deployAppImageWithDependencies(
 
   if (dockerLocalImages && !resolvedImageId) {
     resolvedImageId = (await docker.inspectImage(payload.imageUrl))?.Id ?? null;
+  }
+
+  const releaseJobs = releasePhases ? (payload.releaseJobs ?? null) : null;
+  const releaseTarget = releaseJobs
+    ? buildReleaseJobTarget(docker, {
+        ...payload,
+        image: payload.imageUrl,
+        pullImage: !dockerLocalImages,
+        // Exactly what the candidate container is given, PORT included.
+        envVars: { ...payload.envVars, PORT: String(appPort) },
+        resourceSettings: toDockerResourceSettings(
+          resolveRuntimeResourceLimits(payload.resourceLimits, "app")
+        ),
+      })
+    : null;
+  const providedHostname = payload.providedHostname ?? `${payload.subdomain}.${APP_DOMAIN}`;
+  const customHostnames = payload.customHostnames ?? [];
+  if (
+    releasePhases &&
+    releaseJobs?.verificationRolledBack &&
+    previousContainer &&
+    previousServiceUrl &&
+    (await returnTrafficFromRejectedRelease(dependencies, docker, {
+      serviceId: payload.serviceId,
+      hostnames: { providedHostname, customHostnames },
+      previousContainer,
+      previousServiceUrl,
+      previousPort: resolveAppRuntimePort(payload.runtimeMetadata, appPort),
+      candidateContainerName: adoptedCandidate ? containerName : null,
+      rollout,
+    }))
+  ) {
+    throw new ReleaseJobHaltError(
+      "Verification of this deployment already failed and traffic was returned to the previous deployment; it is not activated again",
+      buildAppRolloutResult({
+        strategy: rolloutStrategy,
+        outcome: "aborted_before_cutover",
+        currentPhase: "release",
+        liveRuntimePreserved: true,
+        rollbackCompleted: true,
+        activeContainerName: previousContainer,
+        candidateContainerName: containerName,
+      })
+    );
+  }
+  if (releasePhases && releaseTarget && releaseJobs?.preActivation) {
+    // Before anything is quiesced or created: a failed job leaves the live deployment untouched.
+    await runPreActivation(
+      releasePhases,
+      releaseTarget,
+      {
+        phase: "pre_activation",
+        command: releaseJobs.preActivation.command,
+        timeoutSeconds: releaseJobs.preActivation.timeoutSeconds,
+      },
+      buildAppRolloutResult({
+        strategy: rolloutStrategy,
+        outcome: "aborted_before_cutover",
+        currentPhase: "release",
+        liveRuntimePreserved: Boolean(previousContainer) || adoptedCandidate !== null,
+        rollbackCompleted: false,
+        activeContainerName: adoptedCandidate ? containerName : previousContainer,
+        candidateContainerName: containerName,
+      })
+    );
   }
 
   if (payload.volume && !adoptedCandidate) {
@@ -3283,8 +3566,7 @@ export async function deployAppImageWithDependencies(
   }
 
   const candidateServiceUrl = `http://${containerName}:${appPort}`;
-  const providedHostname = payload.providedHostname ?? `${payload.subdomain}.${APP_DOMAIN}`;
-  const customHostnames = payload.customHostnames ?? [];
+  let trafficReturnedToPrevious = false;
   try {
     await dependencies.writeLocalTraefikRoute(
       TRAEFIK_PATHS,
@@ -3301,6 +3583,95 @@ export async function deployAppImageWithDependencies(
       candidateServiceUrl,
       rollout
     );
+    if (releasePhases && releaseTarget && releaseJobs?.verification) {
+      const verification = releaseJobs.verification;
+      // The previous container is still running and routable until retirement below, so returning
+      // traffic to it is the only thing a rollback does. A volume service's previous container was
+      // stopped for the single-writer cutover, and bringing it back would restore the pre-deploy
+      // snapshot, discarding what the new release wrote — so it keeps the new deployment instead.
+      const rollbackTarget =
+        previousContainer && adoptedCandidate === null && !payload.volume
+          ? previousContainer
+          : null;
+      // Probed once, and only when a failure would roll back: a previous release that is gone or
+      // crash-looping (often why the fix is being deployed) cannot take the traffic back.
+      let previousCanServe: Promise<boolean> | null = null;
+      const decide = async (outcome: ReleaseJobOutcome) => {
+        const wouldRollBack =
+          rollbackTarget !== null &&
+          verification.onFailure === "rollback" &&
+          (outcome === "failed" || outcome === "timed_out");
+        if (wouldRollBack) {
+          previousCanServe ??= previousAppRuntimeCanServe(
+            dependencies,
+            docker,
+            rollbackTarget,
+            resolveAppRuntimePort(payload.runtimeMetadata, appPort),
+            rollout
+          );
+        }
+        return decideVerificationConsequence({
+          outcome,
+          policy: verification.onFailure,
+          rollbackAvailable: wouldRollBack && (await previousCanServe) === true,
+        });
+      };
+      const result = await runVerificationKeepingOnError(releasePhases, releaseTarget, {
+        phase: "verification",
+        command: verification.command,
+        timeoutSeconds: verification.timeoutSeconds,
+        phaseEnv: { NOUVA_CANDIDATE_URL: candidateServiceUrl },
+        configuredPolicy: verification.onFailure,
+        resolveAppliedPolicy: async (outcome) =>
+          (await decide(outcome)).action === "rollback" ? "rollback" : "keep",
+      });
+      // Only a rollback this run reported, which it decided with a previous runtime that just proved
+      // it serves. Traffic goes back to it before the candidate is removed: should the route not
+      // move, the candidate keeps serving and the deployment goes LIVE, where the control plane
+      // corrects the recorded rollback to keep.
+      if (
+        result.kind === "unsuccessful" &&
+        previousServiceUrl &&
+        result.appliedPolicy === "rollback"
+      ) {
+        trafficReturnedToPrevious = await moveAppTraffic(
+          dependencies,
+          payload.serviceId,
+          { providedHostname, customHostnames },
+          previousServiceUrl,
+          rollout
+        );
+        if (trafficReturnedToPrevious) {
+          throw new Error(result.message);
+        }
+        console.warn(
+          `[nouva-agent] verification of deployment ${payload.deploymentId} failed, but traffic ` +
+            "could not return to the previous release; keeping the new one"
+        );
+        try {
+          await dependencies.writeLocalTraefikRoute(
+            TRAEFIK_PATHS,
+            payload.serviceId,
+            { providedHostname, customHostnames },
+            candidateServiceUrl
+          );
+          await waitForLocalTraefikCutover(
+            dependencies.fetchImpl,
+            payload.serviceId,
+            candidateServiceUrl,
+            rollout
+          );
+        } catch (routeError) {
+          // Kept out of the catch below, which would remove the candidate: it is the release most
+          // likely serving now, and the route left as it is beats taking that away as well.
+          console.warn(
+            `[nouva-agent] could not confirm the route back to deployment ${payload.deploymentId}; ` +
+              "keeping it",
+            routeError
+          );
+        }
+      }
+    }
   } catch (error) {
     // This candidate can already be serving an accepted deployment; failed revalidation is not
     // permission to roll it back or restore an older volume snapshot.
@@ -3339,7 +3710,9 @@ export async function deployAppImageWithDependencies(
       }
     }
     try {
-      if (previousServiceUrl) {
+      if (trafficReturnedToPrevious) {
+        // A failed verification already moved traffic back before the candidate was removed.
+      } else if (previousServiceUrl) {
         await dependencies.writeLocalTraefikRoute(
           TRAEFIK_PATHS,
           payload.serviceId,
@@ -3481,13 +3854,15 @@ export async function deployAppImageWithDependencies(
 export async function deployAppImage(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
-  payload: DeployAppImageInput
+  payload: DeployAppImageInput,
+  releasePhases?: ReleasePhaseRunner
 ) {
   return await deployAppImageWithDependencies(
     defaultDeployAppImageDependencies,
     docker,
     config,
-    payload
+    payload,
+    releasePhases
   );
 }
 
@@ -3495,7 +3870,8 @@ async function handleBuildAndDeployApp(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
   payload: AppDeployPayload,
-  onBuildLog?: BuildLogEmitter
+  onBuildLog?: BuildLogEmitter,
+  releasePhases?: ReleasePhaseRunner
 ) {
   const dependencies = {
     ensureBaseRuntime,
@@ -3512,7 +3888,8 @@ async function handleBuildAndDeployApp(
       config,
       payload,
       buildkitRuntime,
-      onBuildLog
+      onBuildLog,
+      releasePhases
     );
   } finally {
     await buildkitRuntime.cleanup();
@@ -3543,7 +3920,8 @@ async function handleBuildAndDeployWorker(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
   payload: WorkerDeployPayload,
-  onBuildLog?: BuildLogEmitter
+  onBuildLog?: BuildLogEmitter,
+  releasePhases?: ReleasePhaseRunner
 ) {
   const requestedBuildType = payload.appBuildType as string | null | undefined;
   if (requestedBuildType === "static") {
@@ -3572,6 +3950,40 @@ async function handleBuildAndDeployWorker(
       platformGeneratedValues: payload.platformGeneratedValues ?? [],
       ...(onBuildLog ? { onBuildLog } : {}),
     });
+    const releaseJobs = releasePhases ? (payload.releaseJobs ?? null) : null;
+    const releaseTarget = releaseJobs
+      ? buildReleaseJobTarget(docker, {
+          ...payload,
+          image: buildResult.imageUrl,
+          pullImage: config.imageStoreMode !== "docker-local",
+          envVars: payload.envVars,
+          resourceSettings: toDockerResourceSettings(payload.resourceLimits),
+        })
+      : null;
+    if (releasePhases && releaseTarget && releaseJobs?.preActivation) {
+      await docker.ensureNetwork(releaseTarget.networkName, {
+        "nouva.managed": "true",
+        "nouva.server.id": SERVER_ID!,
+        "nouva.project.id": payload.projectId,
+      });
+      const previousRuntime = payload.runtimeMetadata;
+      await runPreActivation(
+        releasePhases,
+        releaseTarget,
+        {
+          phase: "pre_activation",
+          command: releaseJobs.preActivation.command,
+          timeoutSeconds: releaseJobs.preActivation.timeoutSeconds,
+        },
+        {
+          liveRuntimePreserved: Boolean(
+            previousRuntime?.containerName ||
+              previousRuntime?.containerId ||
+              (previousRuntime?.replicas?.length ?? 0) > 0
+          ),
+        }
+      );
+    }
     const result = await deployWorkerRuntime(
       docker,
       getWorkerRuntimeEnvironment(config),
@@ -3583,6 +3995,17 @@ async function handleBuildAndDeployWorker(
           }
         : {}
     );
+    if (releasePhases && releaseTarget && releaseJobs?.verification) {
+      // Workers only keep: their previous replicas are already retired, so there is nothing idle to
+      // return to. The result is recorded and shown on the live deployment.
+      await runVerificationKeepingOnError(releasePhases, releaseTarget, {
+        phase: "verification",
+        command: releaseJobs.verification.command,
+        timeoutSeconds: releaseJobs.verification.timeoutSeconds,
+        configuredPolicy: releaseJobs.verification.onFailure,
+        resolveAppliedPolicy: () => "keep",
+      });
+    }
     return {
       ...result,
       buildDuration: buildResult.buildDuration,
@@ -5764,6 +6187,32 @@ function createWorkItemBuildLogPublisher(
   });
 }
 
+function createReleaseJobControlPlane(
+  credentials: StoredCredentials,
+  workItemId: string,
+  leaseId: string
+): ReleaseJobControlPlane {
+  const leaseProof = { serverId: SERVER_ID!, leaseId };
+  return {
+    claim: (phase, context) =>
+      apiRequest<ReleaseJobClaimResponse>(
+        `/api/agent/work/${workItemId}/release-jobs/${phase}/claim`,
+        {
+          method: "POST",
+          token: credentials.agentToken,
+          body: { ...leaseProof, ...context } satisfies ReleaseJobClaimRequest,
+        }
+      ),
+    report: async (phase, report) => {
+      await apiRequest(`/api/agent/work/${workItemId}/release-jobs/${phase}/report`, {
+        method: "POST",
+        token: credentials.agentToken,
+        body: { ...leaseProof, ...report },
+      });
+    },
+  };
+}
+
 async function processWorkItem(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
@@ -5837,6 +6286,12 @@ async function processWorkItem(
       ),
     prepare: async () => {
       const buildLogPublisher = createWorkItemBuildLogPublisher(credentials, workItem, payload);
+      const releasePhases = createReleasePhaseRunner({
+        docker,
+        controlPlane: createReleaseJobControlPlane(credentials, workItem.id, workItem.leaseId!),
+        clock: { now: () => Date.now(), sleep },
+        ...(buildLogPublisher ? { onBuildLog: buildLogPublisher.emit } : {}),
+      });
 
       let failureResult: Record<string, unknown> | undefined;
       let workError: Error | null = null;
@@ -5850,7 +6305,8 @@ async function processWorkItem(
               docker,
               config,
               payload as unknown as AppDeployPayload,
-              buildLogPublisher?.emit
+              buildLogPublisher?.emit,
+              releasePhases
             );
             break;
           case "rollback_app":
@@ -5866,7 +6322,8 @@ async function processWorkItem(
               docker,
               config,
               payload as unknown as WorkerDeployPayload,
-              buildLogPublisher?.emit
+              buildLogPublisher?.emit,
+              releasePhases
             );
             break;
           case "rollback_worker":
@@ -6034,11 +6491,19 @@ async function processWorkItem(
         if (
           err instanceof AppRolloutError ||
           err instanceof WorkerRolloutError ||
-          err instanceof ExternalBackupImportError
+          err instanceof ExternalBackupImportError ||
+          err instanceof ReleaseJobHaltError
         ) {
           failureResult = err.result;
         }
         workError = err instanceof Error ? err : new Error("Unknown agent work failure");
+      }
+
+      if (workError instanceof ReleaseJobDeferredError) {
+        // No terminal report: the control plane either requeued the work when it answered the
+        // claim, or hands it out again once this lease expires. The next lease opens a new log.
+        await buildLogPublisher?.close();
+        return { kind: "released", reason: workError.message };
       }
 
       if (buildLogPublisher) {

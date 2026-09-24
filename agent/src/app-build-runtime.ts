@@ -2,6 +2,7 @@ import type { BuildAppResult } from "./build.js";
 import type { BuildLogEmitter } from "./build-logs.js";
 import type { DockerApiClient } from "./docker-api.js";
 import type { AgentRuntimeConfig, AppDeployPayload, RuntimeMetadata } from "./protocol.js";
+import type { ReleasePhaseRunner } from "./release-jobs.js";
 
 export interface DeployAppImageInput {
   projectId: string;
@@ -27,6 +28,8 @@ export interface DeployAppImageInput {
   providedHostname?: string;
   customHostnames?: string[];
   clientIngressConfigHash?: string;
+  releaseJobs?: AppDeployPayload["releaseJobs"];
+  platformGeneratedValues?: AppDeployPayload["platformGeneratedValues"];
 }
 
 /** The scoped BuildKit daemon a deploy builds against, and the memory it was capped at. */
@@ -57,7 +60,8 @@ export interface BuildAndDeployAppDependencies {
   deployAppImage: (
     docker: DockerApiClient,
     config: AgentRuntimeConfig,
-    payload: DeployAppImageInput
+    payload: DeployAppImageInput,
+    releasePhases?: ReleasePhaseRunner
   ) => Promise<Record<string, unknown>>;
 }
 
@@ -67,7 +71,8 @@ export async function buildAndDeployAppWithDependencies(
   config: AgentRuntimeConfig,
   payload: AppDeployPayload,
   buildkit: AppBuildkitRuntime,
-  onBuildLog?: BuildLogEmitter
+  onBuildLog?: BuildLogEmitter,
+  releasePhases?: ReleasePhaseRunner
 ) {
   await dependencies.ensureBaseRuntime(docker, config);
 
@@ -97,14 +102,19 @@ export async function buildAndDeployAppWithDependencies(
     timestamp: Date.now(),
   });
 
-  return await dependencies.deployAppImage(docker, config, {
-    ...payload,
-    imageUrl: buildResult.imageUrl,
-    imageId: buildResult.imageId,
-    buildDuration: buildResult.buildDuration,
-    detectedLanguage: buildResult.detectedLanguage,
-    detectedFramework: buildResult.detectedFramework,
-    languageVersion: buildResult.languageVersion,
-    internalPort: buildResult.internalPort,
-  });
+  return await dependencies.deployAppImage(
+    docker,
+    config,
+    {
+      ...payload,
+      imageUrl: buildResult.imageUrl,
+      imageId: buildResult.imageId,
+      buildDuration: buildResult.buildDuration,
+      detectedLanguage: buildResult.detectedLanguage,
+      detectedFramework: buildResult.detectedFramework,
+      languageVersion: buildResult.languageVersion,
+      internalPort: buildResult.internalPort,
+    },
+    releasePhases
+  );
 }

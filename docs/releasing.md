@@ -52,6 +52,11 @@ result. Version availability for `v0.4.37` has not been checked during this prep
 readiness check and the sync gate before publishing. Neither a local bump nor a green check is
 evidence of a published image or an upgraded server.
 
+Local preparation for release jobs and verification uses `0.4.38`, which runs a deployment's
+pre-activation job before cutover and its verification job after, under a claim the control plane
+records. The control plane holds deployments with release phases until a server reports this
+agent. Version availability for `v0.4.38` has not been checked during this preparation either.
+
 ## Manual validation and runners
 
 Validation workflows (`Control Plane CI`, `Agent Release Readiness`, and public `CI`) run only on

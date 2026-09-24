@@ -154,3 +154,25 @@ test("execution and failure-report errors always produce redacted ID/kind termin
     expect(stopLease).toHaveBeenCalledTimes(1);
   }
 });
+
+test("work the control plane took back is not reported, and its lease renewal stops", async () => {
+  const send = mock(async () => {});
+  const stopLease = mock(async () => {});
+  const logs: string[] = [];
+  await executeAndReportAgentWork({
+    work: { id: "w", kind: "deploy_app" },
+    prepare: async () => ({ kind: "released", reason: "Waiting on deployment dep_olde" }),
+    send,
+    rejectResult: async () => ({ kind: "fail", result: null, errorMessage: "rejected" }),
+    stopLease,
+    redactError: () => "[REDACTED]",
+    log: (message) => {
+      logs.push(message);
+    },
+  });
+  expect(send).not.toHaveBeenCalled();
+  expect(stopLease).toHaveBeenCalledTimes(1);
+  expect(logs).toEqual([
+    "[nouva-agent] work w (deploy_app) returned to the queue: Waiting on deployment dep_olde",
+  ]);
+});

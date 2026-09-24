@@ -1,4 +1,5 @@
 import type { AgentServerMetricPayload } from "@repo/runtime/agent-metrics";
+import type { DeploymentReleasePlan } from "@repo/runtime/release-phases";
 
 export type {
   AgentMetricsEnvelope,
@@ -149,11 +150,13 @@ export type RuntimeMetadata = {
 
 export type AppRolloutStrategy = "candidate_ready_cutover" | "single_writer_snapshot_cutover";
 export type AppRolloutPhase =
+  | "release"
   | "quiesce"
   | "snapshot"
   | "candidate"
   | "ready"
   | "cutover"
+  | "verify"
   | "retire"
   | "restore"
   | "rollback";
@@ -312,6 +315,7 @@ export type AgentCapabilities = {
   externalBackupImportV1?: boolean;
   postgresRepositoryLineageV1?: boolean;
   workerShutdownPolicyV1?: boolean;
+  releasePhasesV1?: boolean;
   [key: string]: boolean | undefined;
 };
 
@@ -548,6 +552,8 @@ export interface AppDeployPayload {
   providedHostname?: string;
   customHostnames?: string[];
   clientIngressConfigHash?: string;
+  /** The deployment's snapshot of its release phases; absent when it has none. */
+  releaseJobs?: DeploymentReleasePlan | null;
 }
 
 export interface DeployOnlyPayload {
@@ -609,6 +615,8 @@ export interface WorkerDeployPayload {
   volume?: AppVolumeIdentity | null;
   resourceLimits: EffectiveServiceResourceLimits;
   runtimeMetadata?: RuntimeMetadata | null;
+  /** The deployment's snapshot of its release phases; absent when it has none. */
+  releaseJobs?: DeploymentReleasePlan | null;
 }
 
 export interface WorkerDeployOnlyPayload {
@@ -973,6 +981,9 @@ export function getDefaultAgentCapabilities(): AgentCapabilities {
     // Declares that a worker rollout honors the service's shutdown signal, grace period and
     // overlap policy, and never force-removes the previous process as normal retirement (#284).
     workerShutdownPolicyV1: true,
+    // Declares that a build deployment's pre-activation job and verification run under a claim
+    // the control plane records. Without it, deployments with release phases wait in the queue.
+    releasePhasesV1: true,
   };
 }
 

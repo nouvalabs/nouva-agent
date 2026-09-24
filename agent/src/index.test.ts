@@ -4,6 +4,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { collectAgentWorkPayloadOperationalValues } from "@repo/runtime/logging";
+import type { ReleasePhase } from "@repo/runtime/release-phases";
 import agentPackageJson from "../package.json" with { type: "json" };
 import { executeAndReportAgentWork } from "./agent-work-reporting.js";
 import type { DeployAppImageInput } from "./app-build-runtime.js";
@@ -44,6 +45,7 @@ import {
   resolveReportedAgentVersion,
   resolveServiceContainerIdentifier,
   rollbackUnreportableWorkResult,
+  runPreActivation,
   type StoredCredentials,
   sanitizeAgentWorkResult,
   shouldStopRetryingAgentWorkMutation,
@@ -58,6 +60,13 @@ import {
   type RestoreVolumeBackupPayload,
   resolveAppRolloutConfig,
 } from "./protocol.js";
+import {
+  ReleaseJobDeferredError,
+  ReleaseJobHaltError,
+  type ReleaseJobTarget,
+  type ReleasePhaseRequest,
+  type ReleasePhaseResult,
+} from "./release-jobs.js";
 
 const runtimeConfig: AgentRuntimeConfig = {
   heartbeatIntervalSeconds: 30,
@@ -2372,6 +2381,549 @@ describe("deployAppImageWithDependencies", () => {
         previousContainerRetirement: "graceful",
       })
     );
+  });
+
+  describe("release phases", () => {
+    const candidateName = "nouva-app-svc_1-dep_1";
+    const liveName = "nouva-app-svc_1-live";
+    const verify = (onFailure: "keep" | "rollback") => ({
+      command: "curl -fsS $NOUVA_CANDIDATE_URL",
+      timeoutSeconds: 30,
+      onFailure,
+    });
+
+    function releaseFixture(releaseJobs: DeployAppImageInput["releaseJobs"]) {
+      const docker = createDockerMock();
+      docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+      docker.inspectContainer.mockImplementation(
+        async (name: string) =>
+          (name === candidateName || name === liveName
+            ? {
+                Id: name === candidateName ? "ctr_candidate" : "ctr_live",
+                Name: name,
+                State: { Running: true },
+                NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.10" } } },
+              }
+            : null) as never
+      );
+      // Traefik reports whichever backend the agent last routed to.
+      let routedUrl = "";
+      const writeLocalTraefikRoute = mock(
+        async (_paths: unknown, _serviceId: string, _hosts: unknown, url: string) => {
+          routedUrl = url;
+        }
+      );
+      const fetchImpl = mock(async () =>
+        Response.json([{ name: "svc-svc_1@file", loadBalancer: { servers: [{ url: routedUrl }] } }])
+      ) as unknown as typeof fetch;
+      const dependencies = {
+        ensureBaseRuntime: async () => undefined,
+        checkTcpConnect: mock(async () => true),
+        fetchImpl,
+        writeLocalTraefikRoute,
+        deleteLocalTraefikRoute: mock(async () => {}),
+        sleep: mock(async () => undefined),
+      };
+      const payload: DeployAppImageInput = {
+        ...appRuntimePayload,
+        volume: null,
+        rollout: createRolloutConfig(),
+        runtimeMetadata: { containerName: liveName, internalPort: 8080 },
+        releaseJobs,
+      };
+      const runs: ReleasePhaseRequest[] = [];
+      const runner = (results: Partial<Record<ReleasePhase, ReleasePhaseResult>>) => ({
+        run: mock(
+          async (
+            _target: ReleaseJobTarget,
+            request: ReleasePhaseRequest
+          ): Promise<ReleasePhaseResult> => {
+            runs.push(request);
+            const result = results[request.phase] ?? { kind: "succeeded" as const, attempt: 1 };
+            // Like a run that just finished an attempt, the result carries the policy it reported.
+            return result.kind === "unsuccessful" && request.resolveAppliedPolicy
+              ? {
+                  ...result,
+                  appliedPolicy: (await request.resolveAppliedPolicy(result.outcome)) ?? null,
+                }
+              : result;
+          }
+        ),
+      });
+      return { docker, dependencies, payload, runs, runner };
+    }
+
+    const failed = (phase: ReleasePhase): ReleasePhaseResult => ({
+      kind: "unsuccessful",
+      attempt: 1,
+      outcome: "failed",
+      message: `The ${phase} job failed`,
+      appliedPolicy: null,
+    });
+
+    test("a failed pre-activation job creates no candidate and keeps the live deployment", async () => {
+      const { docker, dependencies, payload, runs, runner } = releaseFixture({
+        preActivation: { command: "bun run migrate", timeoutSeconds: 60 },
+        verification: null,
+      });
+
+      const error = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        runner({ pre_activation: failed("pre_activation") })
+      ).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ReleaseJobHaltError);
+      expect((error as ReleaseJobHaltError).message).toBe("The pre_activation job failed");
+      expect((error as ReleaseJobHaltError).result.rollout).toMatchObject({
+        outcome: "aborted_before_cutover",
+        currentPhase: "release",
+        liveRuntimePreserved: true,
+        activeContainerName: liveName,
+      });
+      expect(runs.map((request) => request.phase)).toEqual(["pre_activation"]);
+      expect(docker.ensureContainer).not.toHaveBeenCalled();
+      expect(docker.stopContainer).not.toHaveBeenCalled();
+      expect(dependencies.writeLocalTraefikRoute).not.toHaveBeenCalled();
+    });
+
+    const rolledBackRelease = {
+      preActivation: { command: "bun run migrate", timeoutSeconds: 60 },
+      verification: verify("rollback"),
+      verificationRolledBack: true,
+    };
+
+    /** The candidate an earlier run left running, e.g. when it stopped in the middle of rolling back. */
+    function leaveCandidateRunning(docker: ReturnType<typeof releaseFixture>["docker"]) {
+      docker.listContainersByLabels.mockResolvedValue([
+        {
+          Id: "ctr_candidate",
+          Name: `/${candidateName}`,
+          Config: {
+            Image: appRuntimePayload.imageUrl,
+            Labels: {
+              "nouva.managed": "true",
+              "nouva.service.id": "svc_1",
+              "nouva.deployment.id": "dep_1",
+            },
+          },
+          Mounts: [],
+          State: { Running: true },
+        },
+      ] as never);
+    }
+
+    function haltedRollout(error: unknown) {
+      expect(error).toBeInstanceOf(ReleaseJobHaltError);
+      expect((error as ReleaseJobHaltError).message).toContain("already failed");
+      return (error as ReleaseJobHaltError).result.rollout;
+    }
+
+    test("a release an earlier run rolled back is not cut over to again", async () => {
+      const { docker, dependencies, payload, runs, runner } = releaseFixture(rolledBackRelease);
+
+      const error = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        runner({})
+      ).catch((caught: unknown) => caught);
+
+      // Traffic already went back, so the rollback is complete and its message stays as recorded.
+      expect(haltedRollout(error)).toMatchObject({
+        outcome: "aborted_before_cutover",
+        liveRuntimePreserved: true,
+        rollbackCompleted: true,
+        activeContainerName: liveName,
+      });
+      expect(runs).toEqual([]);
+      expect(docker.ensureContainer).not.toHaveBeenCalled();
+      expect(dependencies.writeLocalTraefikRoute.mock.calls.map((call) => call[3])).toEqual([
+        `http://${liveName}:8080`,
+      ]);
+    });
+
+    test("a rollback an earlier run left half done is finished, not undone", async () => {
+      const { docker, dependencies, payload, runs, runner } = releaseFixture(rolledBackRelease);
+      leaveCandidateRunning(docker);
+
+      const error = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        runner({})
+      ).catch((caught: unknown) => caught);
+
+      expect(haltedRollout(error)).toMatchObject({
+        outcome: "aborted_before_cutover",
+        liveRuntimePreserved: true,
+        rollbackCompleted: true,
+        activeContainerName: liveName,
+      });
+      expect(dependencies.writeLocalTraefikRoute.mock.calls.map((call) => call[3])).toEqual([
+        `http://${liveName}:8080`,
+      ]);
+      expect(docker.removeContainer).toHaveBeenCalledWith(candidateName, true);
+      // Traffic left the candidate before the candidate did.
+      expect(dependencies.writeLocalTraefikRoute.mock.invocationCallOrder[0]).toBeLessThan(
+        docker.removeContainer.mock.invocationCallOrder[0]!
+      );
+      expect(runs).toEqual([]);
+    });
+
+    test("a rejected release keeps serving only when the previous one cannot", async () => {
+      const { docker, dependencies, payload, runner } = releaseFixture(rolledBackRelease);
+      leaveCandidateRunning(docker);
+      const inspectServing = docker.inspectContainer.getMockImplementation()!;
+      docker.inspectContainer.mockImplementation(async (name: string) =>
+        name === liveName
+          ? ({
+              Id: "ctr_live",
+              Name: liveName,
+              RestartCount: 4,
+              State: { Running: false, Status: "exited", ExitCode: 1, OOMKilled: false },
+            } as never)
+          : inspectServing(name)
+      );
+
+      const result = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        runner({})
+      );
+
+      expect(result.rollout.outcome).toBe("committed");
+      expect(dependencies.writeLocalTraefikRoute.mock.calls.map((call) => call[3])).toEqual([
+        `http://${candidateName}:8080`,
+      ]);
+      expect(docker.removeContainer).not.toHaveBeenCalledWith(candidateName, true);
+    });
+
+    test("a pre-activation job that breaks down still keeps the live deployment", async () => {
+      const { docker, dependencies, payload } = releaseFixture({
+        preActivation: { command: "bun run migrate", timeoutSeconds: 60 },
+        verification: null,
+      });
+      const phases = {
+        run: mock(async (): Promise<ReleasePhaseResult> => {
+          throw new Error("docker unavailable");
+        }),
+      };
+
+      const error = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        phases
+      ).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ReleaseJobHaltError);
+      expect((error as ReleaseJobHaltError).message).toBe("docker unavailable");
+      expect((error as ReleaseJobHaltError).result.rollout).toMatchObject({
+        outcome: "aborted_before_cutover",
+        liveRuntimePreserved: true,
+        activeContainerName: liveName,
+      });
+      expect(docker.ensureContainer).not.toHaveBeenCalled();
+    });
+
+    test("a pre-activation job that has to wait returns the work instead of failing it", async () => {
+      const { docker, dependencies, payload } = releaseFixture({
+        preActivation: { command: "bun run migrate", timeoutSeconds: 60 },
+        verification: null,
+      });
+      const phases = {
+        run: mock(async (): Promise<ReleasePhaseResult> => {
+          throw new ReleaseJobDeferredError("Waiting on the pre-activation job of deployment x");
+        }),
+      };
+
+      await expect(
+        deployAppImageWithDependencies(
+          dependencies,
+          docker as never,
+          runtimeConfig,
+          payload,
+          phases
+        )
+      ).rejects.toBeInstanceOf(ReleaseJobDeferredError);
+    });
+
+    test("a worker's pre-activation breakdown carries its preserved replicas", async () => {
+      // The worker deploy passes this rollout; its replicas are not touched before the phase ends.
+      const rollout = { liveRuntimePreserved: true };
+      const phases = {
+        run: mock(async (): Promise<ReleasePhaseResult> => {
+          throw Object.assign(new Error("claim rejected"), { status: 404 });
+        }),
+      };
+
+      const error = await runPreActivation(
+        phases,
+        {} as ReleaseJobTarget,
+        { phase: "pre_activation", command: "bun run migrate", timeoutSeconds: 60 },
+        rollout
+      ).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ReleaseJobHaltError);
+      expect((error as ReleaseJobHaltError).result).toEqual({ rollout });
+    });
+
+    test("the pre-activation job runs first, with the candidate's image, env and PORT", async () => {
+      const { docker, dependencies, payload, runner } = releaseFixture({
+        preActivation: { command: "bun run migrate", timeoutSeconds: 60 },
+        verification: null,
+      });
+      const phases = runner({});
+
+      await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        { ...payload, envVars: { DATABASE_URL: "postgres://db/app" } },
+        phases
+      );
+
+      const target = phases.run.mock.calls[0]?.[0];
+      expect(target?.image).toBe(payload.imageUrl);
+      expect(target?.envVars).toEqual({ DATABASE_URL: "postgres://db/app", PORT: "8080" });
+      expect(target?.networkName).toBe(docker.ensureNetwork.mock.calls[0]?.[0] as never);
+      expect(phases.run.mock.invocationCallOrder[0]).toBeLessThan(
+        docker.ensureContainer.mock.invocationCallOrder[0]!
+      );
+    });
+
+    test("a failed verification under rollback returns traffic to the previous deployment", async () => {
+      const { docker, dependencies, payload, runs, runner } = releaseFixture({
+        preActivation: null,
+        verification: verify("rollback"),
+      });
+
+      await expect(
+        deployAppImageWithDependencies(
+          dependencies,
+          docker as never,
+          runtimeConfig,
+          payload,
+          runner({ verification: failed("verification") })
+        )
+      ).rejects.toThrow("The verification job failed");
+
+      expect(runs[0]?.phaseEnv).toEqual({ NOUVA_CANDIDATE_URL: `http://${candidateName}:8080` });
+      expect(await runs[0]?.resolveAppliedPolicy?.("failed")).toBe("rollback");
+      // An unknown result never rolls back, whatever the policy.
+      expect(await runs[0]?.resolveAppliedPolicy?.("outcome_unknown")).toBe("keep");
+      expect(dependencies.writeLocalTraefikRoute.mock.calls.map((call) => call[3])).toEqual([
+        `http://${candidateName}:8080`,
+        `http://${liveName}:8080`,
+      ]);
+      expect(docker.removeContainer).toHaveBeenCalledWith(candidateName, true);
+      // Traffic left the candidate before the candidate did.
+      expect(dependencies.writeLocalTraefikRoute.mock.invocationCallOrder[1]).toBeLessThan(
+        docker.removeContainer.mock.invocationCallOrder[0]!
+      );
+      expect(docker.stopContainer).not.toHaveBeenCalled();
+    });
+
+    test("a rollback whose route cannot move keeps the new deployment serving", async () => {
+      const { docker, dependencies, payload, runner } = releaseFixture({
+        preActivation: null,
+        verification: verify("rollback"),
+      });
+      const route = dependencies.writeLocalTraefikRoute.getMockImplementation()!;
+      dependencies.writeLocalTraefikRoute.mockImplementation(
+        async (paths: unknown, serviceId: string, hosts: unknown, url: string) => {
+          if (url === `http://${liveName}:8080`) {
+            throw new Error("traefik config not writable");
+          }
+          await route(paths, serviceId, hosts, url);
+        }
+      );
+
+      const result = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        runner({ verification: failed("verification") })
+      );
+
+      // LIVE, where the control plane corrects the reported rollback to keep.
+      expect(result.rollout.outcome).toBe("committed");
+      expect(dependencies.writeLocalTraefikRoute.mock.calls.map((call) => call[3])).toEqual([
+        `http://${candidateName}:8080`,
+        `http://${liveName}:8080`,
+        `http://${candidateName}:8080`,
+      ]);
+      expect(docker.removeContainer).not.toHaveBeenCalledWith(candidateName, true);
+    });
+
+    test("a route that moves neither way still keeps the new deployment serving", async () => {
+      const { docker, dependencies, payload, runner } = releaseFixture({
+        preActivation: null,
+        verification: verify("rollback"),
+      });
+      const route = dependencies.writeLocalTraefikRoute.getMockImplementation()!;
+      let candidateWrites = 0;
+      dependencies.writeLocalTraefikRoute.mockImplementation(
+        async (paths: unknown, serviceId: string, hosts: unknown, url: string) => {
+          if (url === `http://${candidateName}:8080`) candidateWrites += 1;
+          if (url === `http://${liveName}:8080` || candidateWrites > 1) {
+            throw new Error("traefik config not writable");
+          }
+          await route(paths, serviceId, hosts, url);
+        }
+      );
+
+      const result = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        runner({ verification: failed("verification") })
+      );
+
+      expect(result.rollout.outcome).toBe("committed");
+      expect(docker.removeContainer).not.toHaveBeenCalledWith(candidateName, true);
+    });
+
+    test("a failed verification under keep leaves the new deployment serving", async () => {
+      const { docker, dependencies, payload, runs, runner } = releaseFixture({
+        preActivation: null,
+        verification: verify("keep"),
+      });
+
+      const result = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        runner({ verification: failed("verification") })
+      );
+
+      expect(result.rollout.outcome).toBe("committed");
+      expect(await runs[0]?.resolveAppliedPolicy?.("failed")).toBe("keep");
+      expect(dependencies.writeLocalTraefikRoute).toHaveBeenCalledTimes(1);
+      expect(docker.stopContainer).toHaveBeenCalledWith(liveName, 10, 15_000);
+    });
+
+    test("a verification settled by an earlier run is not rolled back again", async () => {
+      const { docker, dependencies, payload } = releaseFixture({
+        preActivation: null,
+        verification: verify("rollback"),
+      });
+      const phases = { run: mock(async () => failed("verification")) };
+
+      const result = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        phases
+      );
+
+      // No policy reported by this run: the result was decided, and acted on, back then.
+      expect(result.rollout.outcome).toBe("committed");
+      expect(dependencies.writeLocalTraefikRoute).toHaveBeenCalledTimes(1);
+    });
+
+    test("a verification that cannot run keeps the new deployment even under rollback", async () => {
+      const { docker, dependencies, payload } = releaseFixture({
+        preActivation: null,
+        verification: verify("rollback"),
+      });
+      const phases = {
+        run: mock(async (): Promise<ReleasePhaseResult> => {
+          throw new Error("control plane unreachable");
+        }),
+      };
+
+      const result = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        phases
+      );
+
+      expect(result.rollout.outcome).toBe("committed");
+      expect(dependencies.writeLocalTraefikRoute).toHaveBeenCalledTimes(1);
+    });
+
+    test("a previous deployment that cannot serve keeps the new one under rollback", async () => {
+      const { docker, dependencies, payload, runs, runner } = releaseFixture({
+        preActivation: null,
+        verification: verify("rollback"),
+      });
+      const inspectServing = docker.inspectContainer.getMockImplementation()!;
+      // The live release is crash-looping, which is often why a fix is being deployed.
+      docker.inspectContainer.mockImplementation(async (name: string) =>
+        name === liveName
+          ? ({
+              Id: "ctr_live",
+              Name: liveName,
+              RestartCount: 4,
+              State: { Running: false, Status: "exited", ExitCode: 1, OOMKilled: false },
+            } as never)
+          : inspectServing(name)
+      );
+
+      const result = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        runner({ verification: failed("verification") })
+      );
+
+      expect(result.rollout.outcome).toBe("committed");
+      expect(await runs[0]?.resolveAppliedPolicy?.("failed")).toBe("keep");
+      expect(dependencies.writeLocalTraefikRoute.mock.calls.map((call) => call[3])).toEqual([
+        `http://${candidateName}:8080`,
+      ]);
+      expect(docker.removeContainer).not.toHaveBeenCalledWith(candidateName, true);
+    });
+
+    test("without a previous deployment there is nothing to roll back to", async () => {
+      const { docker, dependencies, payload, runs, runner } = releaseFixture({
+        preActivation: null,
+        verification: verify("rollback"),
+      });
+
+      const result = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        { ...payload, runtimeMetadata: null },
+        runner({ verification: failed("verification") })
+      );
+
+      expect(result.rollout.outcome).toBe("committed");
+      expect(await runs[0]?.resolveAppliedPolicy?.("failed")).toBe("keep");
+    });
+
+    test("an agent without a runner ignores release jobs", async () => {
+      const { docker, dependencies, payload } = releaseFixture({
+        preActivation: { command: "exit 1", timeoutSeconds: 60 },
+        verification: null,
+      });
+
+      const result = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload
+      );
+
+      expect(result.rollout.outcome).toBe("committed");
+    });
   });
 
   test("waits for Docker health instead of accepting TCP while health is starting", async () => {
