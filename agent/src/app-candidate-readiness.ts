@@ -102,15 +102,35 @@ function mergeExitCode(previous: number | null, reported: number | null): number
   return reported;
 }
 
+/**
+ * Whether this inspection shows the container killed for memory. Without `outOfMemoryAtStart` the
+ * flag counts as reported. With it, the flag may describe a kill the container survived, so it only
+ * counts when the container was not found up with it at the start and is seen going down with it.
+ */
+function readOutOfMemory(
+  inspection: DockerContainerInspection,
+  restarts: number,
+  outOfMemoryAtStart: boolean | undefined
+): boolean {
+  const state = inspection.State;
+  if (state?.OOMKilled !== true) return false;
+  if (outOfMemoryAtStart === undefined) return true;
+  const wentDown =
+    restarts > 0 || state.Running !== true || state.Status?.toLowerCase() === "restarting";
+  return !outOfMemoryAtStart && wentDown;
+}
+
 function recordEvidence(
   previous: CandidateRuntimeEvidence,
   inspection: DockerContainerInspection,
-  restartBaseline: number
+  restartBaseline: number,
+  outOfMemoryAtStart: boolean | undefined
 ): CandidateRuntimeEvidence {
   const reportedRestarts = readNonNegativeInteger(inspection.RestartCount) ?? 0;
+  const restarts = Math.max(previous.restarts, Math.max(0, reportedRestarts - restartBaseline));
   return {
-    outOfMemory: previous.outOfMemory || inspection.State?.OOMKilled === true,
-    restarts: Math.max(previous.restarts, Math.max(0, reportedRestarts - restartBaseline)),
+    outOfMemory: previous.outOfMemory || readOutOfMemory(inspection, restarts, outOfMemoryAtStart),
+    restarts,
     exitCode: mergeExitCode(previous.exitCode, readReportedExitCode(inspection.State)),
     memoryLimitBytes:
       readPositiveByteLimit(inspection.HostConfig?.Memory) ?? previous.memoryLimitBytes,
@@ -218,8 +238,23 @@ export function assessCandidateReadiness(input: {
    * place — rather than replaced — would otherwise be judged by restarts it recovered from long ago.
    */
   restartBaseline?: number;
+  /**
+   * For a container that was already running when this supervision window began: whether its
+   * first inspection found it up with Docker's `OOMKilled` flag set, a memory kill it survived.
+   * Such a flag says nothing about whether it serves: Docker 24 and later raise it when any
+   * process in the container is killed for memory, a worker the container outlives included, and
+   * earlier versions keep it across restart-policy restarts. Given, a memory kill counts only when
+   * this was `false` and the flag is then seen with the container going down. Left out, as for a
+   * new candidate, the flag counts as soon as it is reported.
+   */
+  outOfMemoryAtStart?: boolean;
 }): CandidateReadinessAssessment {
-  const evidence = recordEvidence(input.evidence, input.inspection, input.restartBaseline ?? 0);
+  const evidence = recordEvidence(
+    input.evidence,
+    input.inspection,
+    input.restartBaseline ?? 0,
+    input.outOfMemoryAtStart
+  );
   const { containerName } = input;
   const subject = input.subject ?? DEFAULT_READINESS_SUBJECT;
   const state = input.inspection.State;

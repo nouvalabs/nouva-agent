@@ -12,7 +12,10 @@ import {
   type ImportExternalBackupPayload,
   verifyExternalBackupArtifact,
 } from "@repo/runtime/external-backup-import";
-import { collectAgentWorkPayloadOperationalValues } from "@repo/runtime/logging";
+import {
+  collectAgentRolloutVocabularyFields,
+  collectAgentWorkPayloadOperationalValues,
+} from "@repo/runtime/logging";
 import {
   decideVerificationConsequence,
   type ReleaseJobClaimRequest,
@@ -75,6 +78,7 @@ import {
   toDockerResourceSettings,
 } from "./docker-resource-limits.js";
 import { ensureHostKernelSettings, HOST_INOTIFY_MAX_USER_WATCHES } from "./host-tuning.js";
+import { separatePgBackrestCredentials } from "./pgbackrest-credentials.js";
 import { collectPostgresObservabilitySamples } from "./postgres-observability.js";
 import {
   type AgentBuildLogsRequest,
@@ -124,6 +128,7 @@ import {
   type WorkerJobLifecyclePayload,
   type WorkerJobPayload,
 } from "./protocol.js";
+import { createRearmableInterval } from "./rearmable-interval.js";
 import {
   createReleasePhaseRunner,
   type ReleaseJobControlPlane,
@@ -159,7 +164,15 @@ import {
   type TraefikRuntimeInput,
   writeLocalTraefikRoute,
 } from "./traefik-runtime.js";
-import { resolveUpdateAgentImageRef, toUpdateAgentPayload } from "./update-agent.js";
+import {
+  type AgentUpdateCompletionDelivery,
+  isAgentUpdateAlreadyApplied,
+  recordAgentUpdateCompletionAttempt,
+  resolveUpdateAgentImageRef,
+  shouldStartAgentUpdater,
+  startAgentUpdaterAfterDrain,
+  toUpdateAgentPayload,
+} from "./update-agent.js";
 import { createVolumeMetricsCollector } from "./volume-metrics-loop.js";
 import {
   hasReplacedVolumeForGeneration,
@@ -171,6 +184,7 @@ import {
   cleanupWorkerJob,
   deployWorkerRuntime,
   inspectWorkerJob,
+  previousWorkerRuntimeRuns,
   removeWorkerServiceRuntime,
   restartWorkerServiceRuntime,
   startWorkerJob,
@@ -220,6 +234,12 @@ const BUILDKIT_GC_KEEP_STORAGE =
   process.env.NOUVA_AGENT_BUILDKIT_GC_KEEP_STORAGE || "1000,4000,8000";
 const DEFAULT_AGENT_CONTAINER_NAME = "nouva-agent";
 const DEFAULT_AGENT_IMAGE = "ghcr.io/nouvalabs/nouva-agent:latest";
+/**
+ * Kept well inside the control plane's 15-minute rollout confirmation window, which starts when
+ * the update work item completes, so the restarted agent can still confirm the release in time.
+ */
+const AGENT_UPDATE_DRAIN_TIMEOUT_MS = 10 * 60_000;
+const AGENT_UPDATER_RESTART_GRACE_MS = 2 * 60_000;
 const APP_VOLUME_SNAPSHOT_IMAGE = "alpine:3.21";
 
 function ensureTraefikRuntimeSerialized(
@@ -282,7 +302,7 @@ export function buildUpdateAgentRuntimeEnv(
   imageRef: string
 ): {
   updaterEnv: string[];
-  envInheritFlags: string;
+  envInheritArgs: string[];
 } {
   const inheritedNouvaEnvKeys = getInheritedNouvaEnvKeys(env);
   const updaterEnv = [
@@ -290,17 +310,46 @@ export function buildUpdateAgentRuntimeEnv(
     `NOUVA_AGENT_IMAGE=${imageRef}`,
     `NOUVA_AGENT_TARGET_IMAGE=${imageRef}`,
   ];
-  const envInheritFlags = [
+  const envInheritArgs = [
     ...inheritedNouvaEnvKeys,
     "NOUVA_AGENT_IMAGE",
     "NOUVA_AGENT_TARGET_IMAGE",
-  ]
-    .map((key) => `-e ${key}`)
-    .join(" ");
+  ].flatMap((key) => ["-e", key]);
 
   return {
     updaterEnv,
-    envInheritFlags,
+    envInheritArgs,
+  };
+}
+
+/**
+ * Fixed script: every value reaches it through the environment or as positional arguments ("$@"),
+ * never by splicing text into the script, so an image ref or env key cannot inject shell.
+ */
+const AGENT_UPDATER_SCRIPT = [
+  `docker stop ${DEFAULT_AGENT_CONTAINER_NAME} || true`,
+  `docker rm ${DEFAULT_AGENT_CONTAINER_NAME} || true`,
+  `exec docker run -d --name ${DEFAULT_AGENT_CONTAINER_NAME} --restart unless-stopped --network host` +
+    ` -v /var/run/docker.sock:/var/run/docker.sock -v /:/hostfs:ro` +
+    ` -v "$NOUVA_AGENT_DATA_VOLUME:/var/lib/nouva-agent"` +
+    ` "$@" "$NOUVA_AGENT_TARGET_IMAGE"`,
+].join("\n");
+
+export function buildAgentUpdaterContainerSpec(
+  env: Record<string, string | undefined>,
+  imageRef: string
+): DockerContainerSpec {
+  const { updaterEnv, envInheritArgs } = buildUpdateAgentRuntimeEnv(env, imageRef);
+  return {
+    name: "nouva-agent-updater",
+    image: "docker:cli",
+    cmd: ["sh", "-c", AGENT_UPDATER_SCRIPT, "nouva-agent-updater", ...envInheritArgs],
+    env: updaterEnv,
+    hostConfig: {
+      AutoRemove: true,
+      NetworkMode: "host",
+      Binds: ["/var/run/docker.sock:/var/run/docker.sock"],
+    },
   };
 }
 
@@ -710,8 +759,8 @@ function buildAppRolloutResult(input: {
 class AppRolloutError extends Error {
   readonly result: Record<string, unknown>;
 
-  constructor(message: string, rollout: AppRolloutResult) {
-    super(message);
+  constructor(message: string, rollout: AppRolloutResult, options?: ErrorOptions) {
+    super(message, options);
     this.name = "AppRolloutError";
     this.result = {
       rollout,
@@ -742,11 +791,20 @@ async function waitForAppCandidateReadiness(
   docker: Pick<DockerApiClient, "inspectContainer">,
   containerName: string,
   appPort: number,
-  rollout: AppRolloutConfig
+  rollout: AppRolloutConfig,
+  /**
+   * For a container that kept running up to this check. Docker keeps its restart count and its
+   * out-of-memory flag across its whole life, and what it recovered from long ago says nothing
+   * about now, so it is judged only by what this check observes. A candidate, or a container just
+   * started by hand (which resets both), has no history to leave out.
+   */
+  { alreadyRunning = false }: { alreadyRunning?: boolean } = {}
 ): Promise<void> {
   const deadline = Date.now() + rollout.readiness.timeoutMs;
   let evidence = NO_CANDIDATE_RUNTIME_EVIDENCE;
   let lastError = "candidate container did not become ready";
+  // Taken from the first inspection of a container that was already running.
+  let history: { restarts: number; outOfMemory: boolean } | null = null;
 
   while (Date.now() <= deadline) {
     const inspection = await docker.inspectContainer(containerName);
@@ -754,11 +812,23 @@ async function waitForAppCandidateReadiness(
       throw new Error(`Candidate container ${containerName} is missing`);
     }
 
+    if (alreadyRunning) {
+      const state = inspection.State;
+      // Only a container found up has survived the kill its flag records. One found waiting to
+      // restart, or stopped, may be going down for it, so there the flag counts as reported.
+      const up = state?.Running === true && state.Status?.toLowerCase() === "running";
+      history ??= {
+        restarts: readRestartCount(inspection),
+        outOfMemory: up && state?.OOMKilled === true,
+      };
+    }
     const assessment = assessCandidateReadiness({
       containerName,
       appPort,
       inspection,
       evidence,
+      restartBaseline: history?.restarts,
+      outOfMemoryAtStart: history?.outOfMemory,
     });
     evidence = assessment.evidence;
     const step = assessment.step;
@@ -805,23 +875,38 @@ function getRetirementErrorType(error: unknown): string {
 
 async function retirePreviousAppContainer(
   dependencies: Pick<DeployAppImageDependencies, "sleep">,
-  docker: Pick<DockerApiClient, "removeContainer" | "stopContainer">,
+  docker: Pick<DockerApiClient, "inspectContainer" | "removeContainer" | "stopContainer">,
   containerName: string,
   serviceId: string,
   deploymentId: string,
   rollout: AppRolloutConfig,
-  drainDurationMs: number
+  drainDurationMs: number,
+  /** A stop an earlier step of this rollout already made; retirement's own then ends nothing. */
+  earlierStop?: AppContainerStop
 ): Promise<PreviousContainerRetirement> {
+  if (drainDurationMs > 0) {
+    await (dependencies.sleep ?? sleep)(drainDurationMs);
+  }
+  // Read once, before this rollout first stops the container: a retry finds it already stopped.
+  // The exit code read after retirement's stop is still the one the first stop left behind.
+  const stateBeforeStop = earlierStop
+    ? earlierStop.stateBeforeStop
+    : await readRetiringAppContainerState(
+        docker,
+        containerName,
+        serviceId,
+        deploymentId,
+        "before_stop"
+      );
   for (let attempt = 0; attempt < 3; attempt += 1) {
     if (attempt > 0) await (dependencies.sleep ?? sleep)(1000 * attempt);
     const outcome = await retirePreviousAppContainerAttempt(
-      dependencies,
       docker,
       containerName,
       serviceId,
       deploymentId,
       rollout,
-      attempt === 0 ? drainDurationMs : 0
+      stateBeforeStop
     );
     if (outcome !== "deferred") return outcome;
   }
@@ -829,19 +914,62 @@ async function retirePreviousAppContainer(
   return "deferred";
 }
 
+/** How a process killed with SIGKILL exits: 128 plus the signal number, 9. */
+const SIGKILL_EXIT_CODE = 137;
+
+type AppContainerState = DockerContainerInspection["State"] | null;
+
+/** A stop this rollout made, with the container's state from just before it. */
+interface AppContainerStop {
+  stateBeforeStop: AppContainerState;
+}
+
+/**
+ * How retiring a container stopped it. `docker stop` returns the same whether the process exited on
+ * its stop signal or Docker SIGKILLed it once the grace period ran out, so only the exit code left
+ * behind tells them apart, and only for a container that was running when the stop was issued. One
+ * already stopped, or waiting out a restart after a crash (which Docker also reports as running),
+ * still carries the exit code of that earlier end, which the stop did not cause. Any SIGKILL counts,
+ * an out-of-memory kill included: either way the process did not get to finish shutting down.
+ */
+function describeAppContainerStop(
+  beforeStop: AppContainerState,
+  afterStop: AppContainerState
+): "graceful" | "forced" {
+  const stopEndedIt = beforeStop?.Running === true && beforeStop.Status !== "restarting";
+  return stopEndedIt && afterStop?.ExitCode === SIGKILL_EXIT_CODE ? "forced" : "graceful";
+}
+
+async function readRetiringAppContainerState(
+  docker: Pick<DockerApiClient, "inspectContainer">,
+  containerName: string,
+  serviceId: string,
+  deploymentId: string,
+  stage: "before_quiesce_stop" | "before_stop" | "after_stop"
+): Promise<AppContainerState> {
+  try {
+    return (await docker.inspectContainer(containerName))?.State ?? null;
+  } catch (error) {
+    // Retirement does not depend on it; the stop is only reported as graceful for lack of evidence.
+    console.warn("[nouva-agent] app rollout retirement stop outcome unknown", {
+      containerName,
+      deploymentId,
+      errorType: getRetirementErrorType(error),
+      serviceId,
+      stage,
+    });
+    return null;
+  }
+}
+
 async function retirePreviousAppContainerAttempt(
-  dependencies: Pick<DeployAppImageDependencies, "sleep">,
-  docker: Pick<DockerApiClient, "removeContainer" | "stopContainer">,
+  docker: Pick<DockerApiClient, "inspectContainer" | "removeContainer" | "stopContainer">,
   containerName: string,
   serviceId: string,
   deploymentId: string,
   rollout: AppRolloutConfig,
-  drainDurationMs: number
+  stateBeforeStop: AppContainerState
 ): Promise<PreviousContainerRetirement> {
-  if (drainDurationMs > 0) {
-    await (dependencies.sleep ?? sleep)(drainDurationMs);
-  }
-
   try {
     await docker.stopContainer(
       containerName,
@@ -873,9 +1001,19 @@ async function retirePreviousAppContainerAttempt(
     }
   }
 
+  const stopOutcome = describeAppContainerStop(
+    stateBeforeStop,
+    await readRetiringAppContainerState(
+      docker,
+      containerName,
+      serviceId,
+      deploymentId,
+      "after_stop"
+    )
+  );
   try {
     await docker.removeContainer(containerName, false, rollout.drain.cleanupTimeoutMs);
-    return "graceful";
+    return stopOutcome;
   } catch (error) {
     console.warn("[nouva-agent] app rollout retirement deferred", {
       containerName,
@@ -959,6 +1097,33 @@ function readKernelRelease(): string | null {
     const release = os.release().trim();
     return release.length > 0 ? release : null;
   } catch {
+    return null;
+  }
+}
+
+const PUBLIC_IP_LOOKUP_TIMEOUT_MS = 5_000;
+
+/**
+ * The public IP is optional in the validation snapshot, so a lookup failure reports null rather
+ * than failing registration or the heartbeat over a third-party service. The timeout keeps an
+ * unreachable lookup service from stalling either of them.
+ */
+export async function lookupPublicIp(
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs = PUBLIC_IP_LOOKUP_TIMEOUT_MS
+): Promise<string | null> {
+  try {
+    const response = await fetchImpl("https://api.ipify.org?format=json", {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) {
+      console.warn(`[nouva-agent] public IP lookup failed with status ${response.status}`);
+      return null;
+    }
+    const body = (await response.json()) as { ip?: unknown };
+    return typeof body.ip === "string" && body.ip.length > 0 ? body.ip : null;
+  } catch (error) {
+    console.warn("[nouva-agent] public IP lookup failed; reporting no public IP", error);
     return null;
   }
 }
@@ -1424,14 +1589,7 @@ async function collectValidationSnapshot(
     );
   }
 
-  let publicIp: string | null = null;
-  try {
-    const response = await fetch("https://api.ipify.org?format=json");
-    if (response.ok) {
-      const body = (await response.json()) as { ip?: string };
-      publicIp = body.ip ?? null;
-    }
-  } catch {}
+  const publicIp = await lookupPublicIp();
 
   const summary = checks.reduce(
     (acc, check) => {
@@ -1698,9 +1856,10 @@ function agentProtocolValueHasRedactionConflict(
 }
 
 /**
- * Sanitizes one protocol field. A rollout's worker shutdown fields are rebuilt from their closed
- * vocabularies rather than redacted, the same way the control plane reads them, so a customer
- * variable equal to "SIGTERM" or "previous" cannot turn a finished rollout into a leak.
+ * Sanitizes one protocol field. A rollout's strategy, outcome and phase, and its worker shutdown
+ * fields, keep their closed vocabularies rather than being redacted, the same way the control plane
+ * reads them, so a customer variable equal to "committed", "SIGTERM" or "previous" cannot turn a
+ * finished rollout into a leak.
  */
 function sanitizeAgentProtocolValue(
   key: (typeof AGENT_WORK_RESULT_PROTOCOL_KEYS)[number],
@@ -1721,6 +1880,7 @@ function sanitizeAgentProtocolValue(
   }
   return {
     ...sanitized,
+    ...collectAgentRolloutVocabularyFields(value as Record<string, unknown>),
     ...sanitizeWorkerRolloutShutdownFields(value as Record<string, unknown>, (containerName) =>
       sanitizeSensitiveProtocolValue(containerName, environmentVariables, operationalValues)
     ),
@@ -2043,9 +2203,11 @@ async function sendHeartbeat(
             await ensureAlloyRuntime(docker, getAlloyRuntimeInput(credentials, nextConfig), {
               paths: ALLOY_PATHS,
             });
-          } catch {
+          } catch (error) {
+            // Adopt the config anyway: every later validation snapshot retries the reload.
             console.error(
-              "[nouva-agent] Alloy redaction context reload failed; validation will retry"
+              "[nouva-agent] Alloy redaction context reload failed; validation will retry",
+              error
             );
           }
         }
@@ -2410,6 +2572,7 @@ async function waitForLocalRegistryAvailability(
   timeoutMs = 15_000
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
+  let lastFailure: unknown = null;
 
   while (Date.now() < deadline) {
     try {
@@ -2417,13 +2580,20 @@ async function waitForLocalRegistryAvailability(
       if (response.ok) {
         return;
       }
-    } catch {}
+      lastFailure = new Error(`registry answered ${response.status}`);
+    } catch (error) {
+      // Refused connections are expected while the registry starts; keep polling until the
+      // deadline and report the last failure if it never comes up.
+      lastFailure = error;
+    }
 
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
 
+  const lastFailureMessage = lastFailure instanceof Error ? `: ${lastFailure.message}` : "";
   throw new Error(
-    `Local registry did not become ready on 127.0.0.1:${config.localRegistryPort} within ${timeoutMs}ms`
+    `Local registry did not become ready on 127.0.0.1:${config.localRegistryPort} within ${timeoutMs}ms${lastFailureMessage}`,
+    { cause: lastFailure }
   );
 }
 
@@ -2772,10 +2942,14 @@ async function runTaskContainer(
   }
   await docker.removeContainer(options.name, true);
 
+  // Backup, restore and expire tasks run pgBackRest with the repository credentials the lease
+  // hydrated; they reach the task as a file so no task container ever shows them in `env`.
+  const { env, files } = separatePgBackrestCredentials(options.env ?? []);
   const id = await docker.createContainer({
     name: options.name,
     image: options.image,
-    env: options.env,
+    env,
+    files,
     entrypoint: options.entrypoint,
     cmd: options.cmd,
     tty: true,
@@ -2904,7 +3078,24 @@ export function buildAppContainerSpec(
   };
 }
 
-function buildAppVolumeSnapshotName(payload: DeployAppImageInput): string {
+const APP_VOLUME_SNAPSHOT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+/**
+ * The name becomes a path inside snapshot task containers, so the IDs it is built from must be
+ * plain identifiers: no separators, dots or shell metacharacters. The scripts also read it from
+ * the environment rather than having it spliced into their text.
+ */
+export function buildAppVolumeSnapshotName(
+  payload: Pick<DeployAppImageInput, "serviceId" | "deploymentId">
+): string {
+  for (const [field, value] of [
+    ["serviceId", payload.serviceId],
+    ["deploymentId", payload.deploymentId],
+  ] as const) {
+    if (!APP_VOLUME_SNAPSHOT_ID_PATTERN.test(value)) {
+      throw new Error(`App volume snapshot refused an unsafe ${field}`);
+    }
+  }
   return `${payload.serviceId}-${payload.deploymentId}.tar.gz`;
 }
 
@@ -2940,10 +3131,11 @@ async function createAppVolumeSnapshot(
     name: `nouva-app-snapshot-${payload.deploymentId.slice(0, 12)}`,
     image: APP_VOLUME_SNAPSHOT_IMAGE,
     entrypoint: ["/bin/sh", "-ec"],
+    env: [`SNAPSHOT_NAME=${snapshotName}`],
     cmd: [
       [
         "mkdir -p /agent-data/app-volume-snapshots",
-        `final=/agent-data/app-volume-snapshots/${snapshotName}`,
+        'final="/agent-data/app-volume-snapshots/$SNAPSHOT_NAME"',
         'if [ -s "$final" ]; then exit 0; fi',
         "required=$(du -sk /source | awk '{print $1}')",
         "available=$(df -Pk /agent-data | awk 'NR==2 {print $4}')",
@@ -2976,9 +3168,10 @@ async function restoreAppVolumeSnapshot(
     name: `nouva-app-restore-${payload.deploymentId.slice(0, 12)}`,
     image: APP_VOLUME_SNAPSHOT_IMAGE,
     entrypoint: ["/bin/sh", "-ec"],
+    env: [`SNAPSHOT_NAME=${snapshotName}`],
     cmd: [
       [
-        `archive=/agent-data/app-volume-snapshots/${snapshotName}`,
+        'archive="/agent-data/app-volume-snapshots/$SNAPSHOT_NAME"',
         'test -s "$archive"',
         "find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +",
         'tar -C /target -xzpf "$archive"',
@@ -3001,7 +3194,8 @@ async function deleteAppVolumeSnapshot(
     name: `nouva-app-snapshot-cleanup-${payload.deploymentId.slice(0, 12)}`,
     image: APP_VOLUME_SNAPSHOT_IMAGE,
     entrypoint: ["/bin/sh", "-ec"],
-    cmd: [[`rm -f /agent-data/app-volume-snapshots/${snapshotName}`].join("\n")],
+    env: [`SNAPSHOT_NAME=${snapshotName}`],
+    cmd: ['rm -f "/agent-data/app-volume-snapshots/$SNAPSHOT_NAME"'],
     mounts: [{ source: DATA_VOLUME, target: "/agent-data" }],
   });
 }
@@ -3016,6 +3210,27 @@ async function deleteAppVolumeSnapshotBestEffort(
     await deleteAppVolumeSnapshot(docker, config, payload, snapshotName);
   } catch (error) {
     console.warn(`Failed to clean app volume snapshot ${snapshotName}`, error);
+  }
+}
+
+/**
+ * Removes the image of a release this rollout rejected, unless the service still refers to it.
+ * Best effort: the rollout error thrown next is what the control plane acts on.
+ */
+async function removeRejectedAppImage(
+  docker: Pick<DockerApiClient, "removeImage">,
+  payload: Pick<DeployAppImageInput, "imageUrl" | "runtimeMetadata">
+): Promise<void> {
+  if (shouldRetainImageReference(payload.runtimeMetadata, payload.imageUrl)) return;
+  try {
+    await docker.removeImage(payload.imageUrl, true);
+  } catch (error) {
+    // Rethrown, it would replace the rollout error and lose its result, which says whether a
+    // release still serves. An image left behind only costs disk space.
+    console.warn(
+      `[nouva-agent] could not remove image ${payload.imageUrl} of a rejected release`,
+      error instanceof Error ? error.message : error
+    );
   }
 }
 
@@ -3128,7 +3343,8 @@ async function runVerificationKeepingOnError(
 
 /**
  * Whether the previous app container could take traffic back right now, judged by the same
- * readiness check a candidate must pass before cutover.
+ * readiness check a candidate must pass before cutover. The container has kept running, so the
+ * restarts and memory kills it recovered from before the check do not count against it.
  */
 async function previousAppRuntimeCanServe(
   dependencies: Pick<DeployAppImageDependencies, "checkTcpConnect">,
@@ -3138,7 +3354,9 @@ async function previousAppRuntimeCanServe(
   rollout: AppRolloutConfig
 ): Promise<boolean> {
   try {
-    await waitForAppCandidateReadiness(dependencies, docker, containerName, appPort, rollout);
+    await waitForAppCandidateReadiness(dependencies, docker, containerName, appPort, rollout, {
+      alreadyRunning: true,
+    });
     return true;
   } catch (error) {
     // Not serving is the answer, not a failure: the new deployment keeps the traffic instead.
@@ -3170,6 +3388,33 @@ async function moveAppTraffic(
     );
     return false;
   }
+}
+
+/**
+ * Routes a service that no container serves: its custom domains answer with the placeholder page
+ * rather than a Traefik 404, and a service without any loses its route.
+ */
+async function routeAppServiceWithoutRuntime(
+  dependencies: Pick<
+    DeployAppImageDependencies,
+    "writeLocalTraefikRoute" | "deleteLocalTraefikRoute"
+  >,
+  config: Pick<AgentRuntimeConfig, "clientIngressPlaceholderUrl">,
+  serviceId: string,
+  customHostnames: string[]
+): Promise<void> {
+  if (customHostnames.length === 0) {
+    await dependencies.deleteLocalTraefikRoute(TRAEFIK_PATHS, serviceId);
+    return;
+  }
+  const placeholderUrl = new URL(config.clientIngressPlaceholderUrl);
+  await dependencies.writeLocalTraefikRoute(
+    TRAEFIK_PATHS,
+    serviceId,
+    { providedHostname: null, customHostnames },
+    placeholderUrl.origin,
+    { passHostHeader: false, replacePath: placeholderUrl.pathname }
+  );
 }
 
 /**
@@ -3243,6 +3488,8 @@ function buildReleaseJobTarget(
     image: string;
     pullImage: boolean;
     envVars: Record<string, string>;
+    /** Variables the agent itself sets on the job, such as the resolved PORT. */
+    agentEnvVars?: Record<string, string>;
     platformGeneratedValues?: readonly string[];
     resourceSettings: DockerResourceSettings;
   }
@@ -3252,7 +3499,7 @@ function buildReleaseJobTarget(
     deploymentId: input.deploymentId,
     image: input.image,
     networkName: buildProjectNetwork(input.projectId),
-    envVars: input.envVars,
+    envVars: { ...input.envVars, ...input.agentEnvVars },
     labels: buildLabels({
       kind: "release_job",
       projectId: input.projectId,
@@ -3262,6 +3509,8 @@ function buildReleaseJobTarget(
       redactionContextVersion: input.redactionContextVersion,
     }),
     resourceSettings: input.resourceSettings,
+    // The agent's own values are not customer material: redacting the resolved PORT hid which port
+    // verification probed (#354). A customer variable with the same value still redacts it.
     redactLogLine: createBuildLogRedactor(input.envVars, input.platformGeneratedValues ?? []),
     prepareImage: async () => {
       if (!(await docker.inspectImage(input.image))) {
@@ -3352,6 +3601,8 @@ export async function deployAppImageWithDependencies(
   let resolvedImageId = payload.imageId ?? null;
   let snapshotName: string | null = null;
   let volumeRolloutPhase: AppRolloutResult["currentPhase"] = "quiesce";
+  // The single-writer quiesce, not retirement, is what stops a volume app's previous container.
+  let previousQuiesceStop: AppContainerStop | undefined;
 
   if (dockerLocalImages && !resolvedImageId) {
     resolvedImageId = (await docker.inspectImage(payload.imageUrl))?.Id ?? null;
@@ -3364,7 +3615,8 @@ export async function deployAppImageWithDependencies(
         image: payload.imageUrl,
         pullImage: !dockerLocalImages,
         // Exactly what the candidate container is given, PORT included.
-        envVars: { ...payload.envVars, PORT: String(appPort) },
+        envVars: payload.envVars,
+        agentEnvVars: { PORT: String(appPort) },
         resourceSettings: toDockerResourceSettings(
           resolveRuntimeResourceLimits(payload.resourceLimits, "app")
         ),
@@ -3387,6 +3639,7 @@ export async function deployAppImageWithDependencies(
       rollout,
     }))
   ) {
+    if (dockerLocalImages) await removeRejectedAppImage(docker, payload);
     throw new ReleaseJobHaltError(
       "Verification of this deployment already failed and traffic was returned to the previous deployment; it is not activated again",
       buildAppRolloutResult({
@@ -3402,24 +3655,47 @@ export async function deployAppImageWithDependencies(
   }
   if (releasePhases && releaseTarget && releaseJobs?.preActivation) {
     // Before anything is quiesced or created: a failed job leaves the live deployment untouched.
-    await runPreActivation(
-      releasePhases,
-      releaseTarget,
-      {
-        phase: "pre_activation",
-        command: releaseJobs.preActivation.command,
-        timeoutSeconds: releaseJobs.preActivation.timeoutSeconds,
-      },
+    const activeContainerName = adoptedCandidate ? containerName : previousContainer;
+    const haltedBeforeCutover = (liveRuntimePreserved: boolean) =>
       buildAppRolloutResult({
         strategy: rolloutStrategy,
         outcome: "aborted_before_cutover",
         currentPhase: "release",
-        liveRuntimePreserved: Boolean(previousContainer) || adoptedCandidate !== null,
+        liveRuntimePreserved,
         rollbackCompleted: false,
-        activeContainerName: adoptedCandidate ? containerName : previousContainer,
+        activeContainerName,
         candidateContainerName: containerName,
-      })
-    );
+      });
+    try {
+      await runPreActivation(
+        releasePhases,
+        releaseTarget,
+        {
+          phase: "pre_activation",
+          command: releaseJobs.preActivation.command,
+          timeoutSeconds: releaseJobs.preActivation.timeoutSeconds,
+        },
+        haltedBeforeCutover(activeContainerName !== null)
+      );
+    } catch (error) {
+      // Untouched is not the same as serving: the live container may be crash-looping, often why
+      // this release was deployed, and the service must not read as running. Probed only on a
+      // halt, so a deploy that goes ahead does not wait on it.
+      if (
+        error instanceof ReleaseJobHaltError &&
+        activeContainerName !== null &&
+        !(await previousAppRuntimeCanServe(
+          dependencies,
+          docker,
+          activeContainerName,
+          adoptedCandidate ? appPort : resolveAppRuntimePort(payload.runtimeMetadata, appPort),
+          rollout
+        ))
+      ) {
+        throw new ReleaseJobHaltError(error.message, haltedBeforeCutover(false));
+      }
+      throw error;
+    }
   }
 
   if (payload.volume && !adoptedCandidate) {
@@ -3434,6 +3710,15 @@ export async function deployAppImageWithDependencies(
     try {
       await assertSingleRunningVolumeConsumer(docker, payload.volume.volumeName, previousContainer);
       if (previousContainer) {
+        previousQuiesceStop = {
+          stateBeforeStop: await readRetiringAppContainerState(
+            docker,
+            previousContainer,
+            payload.serviceId,
+            payload.deploymentId,
+            "before_quiesce_stop"
+          ),
+        };
         await docker.stopContainer(previousContainer);
       }
       await assertSingleRunningVolumeConsumer(docker, payload.volume.volumeName, null);
@@ -3455,10 +3740,7 @@ export async function deployAppImageWithDependencies(
           await dependencies.writeLocalTraefikRoute(
             TRAEFIK_PATHS,
             payload.serviceId,
-            {
-              providedHostname: `${payload.subdomain}.${APP_DOMAIN}`,
-              customHostnames: [],
-            },
+            { providedHostname, customHostnames },
             previousServiceUrl!
           );
           await waitForLocalTraefikCutover(
@@ -3468,7 +3750,14 @@ export async function deployAppImageWithDependencies(
             rollout
           );
           liveRuntimePreserved = true;
-        } catch {}
+        } catch (restartError) {
+          // The snapshot failure below is what gets reported; liveRuntimePreserved=false tells the
+          // control plane the previous release is not serving, and this log says why.
+          console.error(
+            `[nouva-agent] could not return service ${payload.serviceId} to its previous container after the volume snapshot failed`,
+            restartError
+          );
+        }
       }
       throw new AppRolloutError(
         error instanceof Error ? error.message : "App volume snapshot failed",
@@ -3480,7 +3769,8 @@ export async function deployAppImageWithDependencies(
           rollbackCompleted: false,
           activeContainerName: previousContainer,
           candidateContainerName: containerName,
-        })
+        }),
+        { cause: error }
       );
     }
   }
@@ -3514,10 +3804,7 @@ export async function deployAppImageWithDependencies(
           await dependencies.writeLocalTraefikRoute(
             TRAEFIK_PATHS,
             payload.serviceId,
-            {
-              providedHostname: `${payload.subdomain}.${APP_DOMAIN}`,
-              customHostnames: [],
-            },
+            { providedHostname, customHostnames },
             previousServiceUrl!
           );
           await waitForLocalTraefikCutover(
@@ -3527,7 +3814,12 @@ export async function deployAppImageWithDependencies(
             rollout
           );
         } else {
-          await dependencies.deleteLocalTraefikRoute(TRAEFIK_PATHS, payload.serviceId);
+          await routeAppServiceWithoutRuntime(
+            dependencies,
+            config,
+            payload.serviceId,
+            customHostnames
+          );
         }
         await deleteAppVolumeSnapshotBestEffort(docker, config, payload, snapshotName);
       } catch (restoreError) {
@@ -3545,19 +3837,27 @@ export async function deployAppImageWithDependencies(
         );
       }
     }
-    if (
-      dockerLocalImages &&
-      !shouldRetainImageReference(payload.runtimeMetadata, payload.imageUrl)
-    ) {
-      await docker.removeImage(payload.imageUrl, true);
-    }
+    if (dockerLocalImages) await removeRejectedAppImage(docker, payload);
+    // A volume app's previous container was just started again and passed readiness in the
+    // restore above. Any other was left running as it was, which says nothing about whether it
+    // serves: it may be crash-looping, and the service must not read as running.
+    const liveRuntimePreserved =
+      previousContainer !== null &&
+      (Boolean(payload.volume) ||
+        (await previousAppRuntimeCanServe(
+          dependencies,
+          docker,
+          previousContainer,
+          resolveAppRuntimePort(payload.runtimeMetadata, appPort),
+          rollout
+        )));
     throw new AppRolloutError(
       error instanceof Error ? error.message : "Candidate container failed readiness checks",
       buildAppRolloutResult({
         strategy: rolloutStrategy,
         outcome: "aborted_before_cutover",
         currentPhase: "ready",
-        liveRuntimePreserved: Boolean(previousContainer),
+        liveRuntimePreserved,
         rollbackCompleted: false,
         activeContainerName: previousContainer,
         candidateContainerName: containerName,
@@ -3705,7 +4005,9 @@ export async function deployAppImageWithDependencies(
             rollbackCompleted: false,
             activeContainerName: null,
             candidateContainerName: containerName,
-          })
+          }),
+          // The restore failure is reported; the failure that forced the restore travels with it.
+          { cause: error }
         );
       }
     }
@@ -3728,31 +4030,40 @@ export async function deployAppImageWithDependencies(
           previousServiceUrl,
           rollout
         );
-      } else if (customHostnames.length > 0) {
-        const placeholderUrl = new URL(config.clientIngressPlaceholderUrl);
-        await dependencies.writeLocalTraefikRoute(
-          TRAEFIK_PATHS,
-          payload.serviceId,
-          { providedHostname: null, customHostnames },
-          placeholderUrl.origin,
-          { passHostHeader: false, replacePath: placeholderUrl.pathname }
-        );
       } else {
-        await dependencies.deleteLocalTraefikRoute(TRAEFIK_PATHS, payload.serviceId);
+        await routeAppServiceWithoutRuntime(
+          dependencies,
+          config,
+          payload.serviceId,
+          customHostnames
+        );
       }
       if (payload.volume && snapshotName) {
         await deleteAppVolumeSnapshotBestEffort(docker, config, payload, snapshotName);
       }
-    } catch {
+    } catch (rollbackError) {
+      // The cutover failure below is what gets reported; the flags tell the control plane the
+      // rollback did not finish, and this log keeps the reason.
+      console.error(
+        `[nouva-agent] rollback of service ${payload.serviceId} to its previous release failed`,
+        rollbackError
+      );
       rollbackCompleted = false;
       liveRuntimePreserved = false;
     }
-    if (
-      dockerLocalImages &&
-      !shouldRetainImageReference(payload.runtimeMetadata, payload.imageUrl)
-    ) {
-      await docker.removeImage(payload.imageUrl, true);
+    // A volume app's previous container was just started again and passed readiness above. Any
+    // other was left running as it was, which says nothing about whether it serves: it may be
+    // crash-looping, often why this release was deployed, and the service must not read as running.
+    if (liveRuntimePreserved && previousContainer && !payload.volume) {
+      liveRuntimePreserved = await previousAppRuntimeCanServe(
+        dependencies,
+        docker,
+        previousContainer,
+        resolveAppRuntimePort(payload.runtimeMetadata, appPort),
+        rollout
+      );
     }
+    if (dockerLocalImages) await removeRejectedAppImage(docker, payload);
 
     throw new AppRolloutError(
       error instanceof Error ? error.message : "Traefik cutover failed",
@@ -3764,7 +4075,8 @@ export async function deployAppImageWithDependencies(
         rollbackCompleted,
         activeContainerName: previousContainer,
         candidateContainerName: containerName,
-      })
+      }),
+      { cause: error }
     );
   }
 
@@ -3777,7 +4089,8 @@ export async function deployAppImageWithDependencies(
         payload.serviceId,
         payload.deploymentId,
         rollout,
-        drainDurationMs
+        drainDurationMs,
+        previousQuiesceStop
       )
     : null;
   if (payload.volume && snapshotName) {
@@ -3798,7 +4111,16 @@ export async function deployAppImageWithDependencies(
     !sameRetainedRuntimeImage(retainedPreviousImage, nextPreviousImage) &&
     !sameRetainedRuntimeImage(retainedPreviousImage, nextCurrentImage)
   ) {
-    await removeRetainedRuntimeImage(docker, retainedPreviousImage);
+    try {
+      await removeRetainedRuntimeImage(docker, retainedPreviousImage);
+    } catch (error) {
+      // The new release already serves: failing here would report it as broken and leave the
+      // control plane recording the old one as live. An image left behind only costs disk space.
+      console.warn(
+        `[nouva-agent] could not remove retired image ${retainedPreviousImage.reference || retainedPreviousImage.imageId}`,
+        error instanceof Error ? error.message : error
+      );
+    }
   }
 
   return {
@@ -3866,7 +4188,7 @@ export async function deployAppImage(
   );
 }
 
-async function handleBuildAndDeployApp(
+export async function handleBuildAndDeployApp(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
   payload: AppDeployPayload,
@@ -3879,6 +4201,9 @@ async function handleBuildAndDeployApp(
     deployAppImage,
   };
 
+  if (releasePhases && payload.releaseJobs?.preActivation) {
+    await releasePhases.deferWhileBlockingJobRuns(payload);
+  }
   const buildkitRuntime = await prepareAppBuildkitRuntime(docker, payload);
 
   try {
@@ -3916,7 +4241,7 @@ function getWorkerRuntimeEnvironment(config: AgentRuntimeConfig) {
   };
 }
 
-async function handleBuildAndDeployWorker(
+export async function handleBuildAndDeployWorker(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
   payload: WorkerDeployPayload,
@@ -3926,6 +4251,9 @@ async function handleBuildAndDeployWorker(
   const requestedBuildType = payload.appBuildType as string | null | undefined;
   if (requestedBuildType === "static") {
     throw new Error("Worker services do not support Static builds");
+  }
+  if (releasePhases && payload.releaseJobs?.preActivation) {
+    await releasePhases.deferWhileBlockingJobRuns(payload);
   }
   if (config.imageStoreMode === "local-registry") {
     await ensureLocalRegistryRuntime(docker, config);
@@ -3967,22 +4295,38 @@ async function handleBuildAndDeployWorker(
         "nouva.project.id": payload.projectId,
       });
       const previousRuntime = payload.runtimeMetadata;
-      await runPreActivation(
-        releasePhases,
-        releaseTarget,
-        {
-          phase: "pre_activation",
-          command: releaseJobs.preActivation.command,
-          timeoutSeconds: releaseJobs.preActivation.timeoutSeconds,
-        },
-        {
-          liveRuntimePreserved: Boolean(
-            previousRuntime?.containerName ||
-              previousRuntime?.containerId ||
-              (previousRuntime?.replicas?.length ?? 0) > 0
-          ),
-        }
+      const hasPreviousReplicas = Boolean(
+        previousRuntime?.containerName ||
+          previousRuntime?.containerId ||
+          (previousRuntime?.replicas?.length ?? 0) > 0
       );
+      try {
+        await runPreActivation(
+          releasePhases,
+          releaseTarget,
+          {
+            phase: "pre_activation",
+            command: releaseJobs.preActivation.command,
+            timeoutSeconds: releaseJobs.preActivation.timeoutSeconds,
+          },
+          { liveRuntimePreserved: hasPreviousReplicas }
+        );
+      } catch (error) {
+        // Untouched is not the same as running: the previous replicas may be crash-looping, often
+        // why this release was deployed, and the service must not read as running. Checked only on
+        // a halt, so a deploy that goes ahead does not wait on it.
+        if (
+          error instanceof ReleaseJobHaltError &&
+          hasPreviousReplicas &&
+          !(await previousWorkerRuntimeRuns(docker, {
+            serviceId: payload.serviceId,
+            runtimeMetadata: previousRuntime,
+          }))
+        ) {
+          throw new ReleaseJobHaltError(error.message, { liveRuntimePreserved: false });
+        }
+        throw error;
+      }
     }
     const result = await deployWorkerRuntime(
       docker,
@@ -4152,6 +4496,11 @@ export function buildDatabaseContainerSpec(payload: DatabaseProvisionPayload): {
   const resolved = resolveDatabaseProvisionSpec(payload);
   const volumeName = getManagedVolumeName(payload);
   const containerName = getDatabaseContainerName(payload);
+  // The long-lived database container runs archive_command for its whole life, so it keeps the
+  // repository credentials for as long as it exists: they go into its filesystem, not its `env`.
+  const { env, files } = separatePgBackrestCredentials(
+    Object.entries(resolved.envVars).map(([key, value]) => `${key}=${value}`)
+  );
 
   const hostConfig: Record<string, unknown> = {
     Mounts: [
@@ -4188,7 +4537,8 @@ export function buildDatabaseContainerSpec(payload: DatabaseProvisionPayload): {
     spec: {
       name: containerName,
       image: resolved.image,
-      env: Object.entries(resolved.envVars).map(([key, value]) => `${key}=${value}`),
+      env,
+      files,
       cmd: resolved.containerArgs.length > 0 ? resolved.containerArgs : undefined,
       labels: buildLabels({
         kind: "database",
@@ -6100,49 +6450,40 @@ async function handleSyncRouting(
   };
 }
 
+/**
+ * Only prepares the update: the updater restarts this agent, so it is handed back through
+ * `scheduleUpdater` and started after the completion is reported and concurrent work has drained.
+ */
 async function handleUpdateAgent(
   docker: DockerApiClient,
-  payload: ReturnType<typeof toUpdateAgentPayload>
+  payload: ReturnType<typeof toUpdateAgentPayload>,
+  scheduleUpdater: (startUpdater: () => Promise<void>) => void
 ): Promise<Record<string, unknown>> {
   const imageRef = resolveUpdateAgentImageRef(payload);
+  const releaseFields = {
+    ...(payload.releaseId ? { releaseId: payload.releaseId } : {}),
+    ...(payload.version ? { version: payload.version } : {}),
+  };
 
-  // Pull the new image before anything else
+  const runningImage = await resolveAgentTaskImage(docker);
+  if (isAgentUpdateAlreadyApplied({ image: runningImage, version: AGENT_VERSION }, payload)) {
+    return { scheduled: false, alreadyApplied: true, imageRef, ...releaseFields };
+  }
+
+  // Both images are pulled now so a registry failure fails this work item instead of surfacing
+  // only after the completion has already been reported.
+  const updaterSpec = buildAgentUpdaterContainerSpec(process.env, imageRef);
   await docker.pullImage(imageRef);
+  await docker.pullImage(updaterSpec.image);
 
-  const { updaterEnv, envInheritFlags } = buildUpdateAgentRuntimeEnv(process.env, imageRef);
-
-  // Build the shell command that runs AFTER we report success
-  const updateCmd = [
-    "sleep 5",
-    "docker stop nouva-agent || true",
-    "docker rm nouva-agent || true",
-    `docker run -d --name nouva-agent --restart unless-stopped --network host` +
-      ` -v /var/run/docker.sock:/var/run/docker.sock -v /:/hostfs:ro` +
-      ` -v "$NOUVA_AGENT_DATA_VOLUME:/var/lib/nouva-agent"` +
-      ` ${envInheritFlags} "$NOUVA_AGENT_TARGET_IMAGE"`,
-  ].join(" && ");
-
-  // Spawn ephemeral updater (auto-removed), fires after we return
-  await docker.ensureContainer(
-    {
-      name: "nouva-agent-updater",
-      image: "docker:cli",
-      cmd: ["sh", "-c", updateCmd],
-      env: updaterEnv,
-      hostConfig: {
-        AutoRemove: true,
-        NetworkMode: "host",
-        Binds: ["/var/run/docker.sock:/var/run/docker.sock"],
-      },
-    },
-    true // replace any previous updater
-  );
+  scheduleUpdater(async () => {
+    await docker.ensureContainer(updaterSpec, true, { pull: false });
+  });
 
   return {
     scheduled: true,
     imageRef,
-    ...(payload.releaseId ? { releaseId: payload.releaseId } : {}),
-    ...(payload.version ? { version: payload.version } : {}),
+    ...releaseFields,
     scheduledAt: new Date().toISOString(),
   };
 }
@@ -6217,7 +6558,8 @@ async function processWorkItem(
   docker: DockerApiClient,
   config: AgentRuntimeConfig,
   credentials: StoredCredentials,
-  workItem: AgentWorkRecord
+  workItem: AgentWorkRecord,
+  requestAgentUpdate: (startUpdater: () => Promise<void>) => void
 ) {
   console.log(`[nouva-agent] processing work ${workItem.id} (${workItem.kind})`);
   if (!workItem.leaseId) {
@@ -6264,21 +6606,33 @@ async function processWorkItem(
     });
     return { kind: "fail", result: null, errorMessage: redactError(new Error(errorMessage)) };
   };
+  let pendingAgentUpdater: (() => Promise<void>) | null = null;
+  let completionDelivery: AgentUpdateCompletionDelivery = "pending";
   await executeAndReportAgentWork({
     work: workItem,
     stopLease: () => leaseRenewal.stop(),
     redactError,
     send: async (report) => {
-      await apiRequest(`/api/agent/work/${workItem.id}/${report.kind}`, {
-        method: "POST",
-        token: credentials.agentToken,
-        body: {
-          serverId: SERVER_ID!,
-          leaseId: workItem.leaseId,
-          result: report.result,
-          ...(report.kind === "fail" ? { errorMessage: report.errorMessage } : {}),
-        },
-      });
+      try {
+        await apiRequest(`/api/agent/work/${workItem.id}/${report.kind}`, {
+          method: "POST",
+          token: credentials.agentToken,
+          body: {
+            serverId: SERVER_ID!,
+            leaseId: workItem.leaseId,
+            result: report.result,
+            ...(report.kind === "fail" ? { errorMessage: report.errorMessage } : {}),
+          },
+        });
+      } catch (error) {
+        if (report.kind === "complete") {
+          completionDelivery = recordAgentUpdateCompletionAttempt(completionDelivery, error);
+        }
+        throw error;
+      }
+      if (report.kind === "complete") {
+        completionDelivery = recordAgentUpdateCompletionAttempt(completionDelivery, null);
+      }
     },
     rejectResult: (error) =>
       reportUnreportableResult(
@@ -6482,7 +6836,13 @@ async function processWorkItem(
             });
             break;
           case "update_agent":
-            result = await handleUpdateAgent(docker, toUpdateAgentPayload(payload));
+            result = await handleUpdateAgent(
+              docker,
+              toUpdateAgentPayload(payload),
+              (startUpdater) => {
+                pendingAgentUpdater = startUpdater;
+              }
+            );
             break;
           default:
             throw new Error(`Unsupported work kind: ${workItem.kind}`);
@@ -6550,6 +6910,17 @@ async function processWorkItem(
       }
     },
   });
+
+  if (pendingAgentUpdater) {
+    if (shouldStartAgentUpdater(completionDelivery)) {
+      requestAgentUpdate(pendingAgentUpdater);
+    } else {
+      console.warn(
+        `[nouva-agent] work ${workItem.id} (${workItem.kind}) completion was not accepted; ` +
+          "skipping the agent restart"
+      );
+    }
+  }
 }
 
 async function collectMetrics(docker: DockerApiClient): Promise<AgentMetricsEnvelope> {
@@ -6683,14 +7054,48 @@ async function main() {
         },
       }),
     processWork: (leasedConfig, workItem) =>
-      processWorkItem(docker, leasedConfig, credentials!, workItem),
+      processWorkItem(docker, leasedConfig, credentials!, workItem, requestAgentUpdate),
     onConfig: (leasedConfig) => {
       config = leasedConfig;
+      applyLoopIntervals(config);
     },
     onWorkError: (error, workItem) => {
       console.error(`[nouva-agent] work ${workItem.id} failed outside its handler`, error);
     },
   });
+
+  // Leasing stops while an update waits for in-flight work, so the restart interrupts nothing new.
+  let agentUpdatePending = false;
+  function requestAgentUpdate(startUpdater: () => Promise<void>): void {
+    if (agentUpdatePending) {
+      console.warn("[nouva-agent] an agent update is already pending; ignoring another");
+      return;
+    }
+    agentUpdatePending = true;
+    console.log("[nouva-agent] agent update reported; draining work before restarting");
+    startAgentUpdaterAfterDrain({
+      isWorkActive: () => workScheduler.isActive(),
+      startUpdater,
+      drainTimeoutMs: AGENT_UPDATE_DRAIN_TIMEOUT_MS,
+      pollIntervalMs: 1000,
+      now: () => Date.now(),
+      sleep,
+      log: (message) => console.warn(message),
+    })
+      .then(() => {
+        console.log("[nouva-agent] agent updater started");
+        // The updater normally stops this container within seconds. If it never does, resume
+        // work instead of leaving the server idle; heartbeats keep reporting the old version.
+        setTimeout(() => {
+          console.error("[nouva-agent] agent updater did not restart the agent; resuming work");
+          agentUpdatePending = false;
+        }, AGENT_UPDATER_RESTART_GRACE_MS).unref();
+      })
+      .catch((error) => {
+        console.error("[nouva-agent] failed to start the agent updater; resuming work", error);
+        agentUpdatePending = false;
+      });
+  }
 
   const shutdown = async () => {
     if (isShuttingDown) return;
@@ -6718,6 +7123,7 @@ async function main() {
   const heartbeatLoop = createAgentHeartbeatLoop({
     runTick: async (signal) => {
       config = await sendHeartbeat(docker, credentials!, config, signal);
+      applyLoopIntervals(config);
     },
     nextDelayMs: () =>
       (config.observability.enabled
@@ -6734,7 +7140,7 @@ async function main() {
   });
   heartbeatLoop.start();
 
-  setInterval(() => {
+  const metricsLoop = createRearmableInterval(() => {
     if (config.observability.enabled || isShuttingDown) {
       return;
     }
@@ -6753,7 +7159,7 @@ async function main() {
       .catch((error) => {
         console.error("[nouva-agent] metrics failed", error);
       });
-  }, config.metricsIntervalSeconds * 1000);
+  });
 
   // Continuing database health is reported through the heartbeat rather than metrics: it must keep
   // working when Alloy owns telemetry, and a dead container produces no metrics at all.
@@ -6789,32 +7195,42 @@ async function main() {
     });
   }, AGENT_VOLUME_METRICS_INTERVAL_MS);
 
-  if (config.postgresObservabilityIntervalSeconds > 0) {
-    setInterval(() => {
-      if (postgresObservabilityLoopActive || isShuttingDown) {
-        return;
-      }
+  const postgresObservabilityLoop = createRearmableInterval(() => {
+    if (postgresObservabilityLoopActive || isShuttingDown) {
+      return;
+    }
 
-      postgresObservabilityLoopActive = true;
-      syncPostgresObservability(docker, credentials!)
-        .catch((error) => {
-          console.error("[nouva-agent] postgres observability sync failed", error);
-        })
-        .finally(() => {
-          postgresObservabilityLoopActive = false;
-        });
-    }, config.postgresObservabilityIntervalSeconds * 1000);
-  }
+    postgresObservabilityLoopActive = true;
+    syncPostgresObservability(docker, credentials!)
+      .catch((error) => {
+        console.error("[nouva-agent] postgres observability sync failed", error);
+      })
+      .finally(() => {
+        postgresObservabilityLoopActive = false;
+      });
+  });
 
-  setInterval(() => {
-    if (isShuttingDown) {
+  const workPollLoop = createRearmableInterval(() => {
+    if (isShuttingDown || agentUpdatePending) {
       return;
     }
 
     void workScheduler.trigger().catch((error) => {
       console.error("[nouva-agent] work loop failed", error);
     });
-  }, config.pollIntervalSeconds * 1000);
+  });
+
+  // Every heartbeat and lease can carry new periods; startup config is only the first of them.
+  function applyLoopIntervals(next: AgentRuntimeConfig): void {
+    workPollLoop.update(next.pollIntervalSeconds * 1000);
+    metricsLoop.update(next.metricsIntervalSeconds * 1000);
+    if (next.postgresObservabilityIntervalSeconds > 0) {
+      postgresObservabilityLoop.update(next.postgresObservabilityIntervalSeconds * 1000);
+    } else {
+      postgresObservabilityLoop.stop();
+    }
+  }
+  applyLoopIntervals(config);
 }
 
 if (import.meta.main) {

@@ -973,4 +973,167 @@ describe("release phase runner", () => {
       expect(containers.has("older_verification")).toBe(false);
     });
   });
+
+  describe("before the build", () => {
+    const running = { Status: "running", Running: true, StartedAt: STARTED_AT };
+    const jobLabels = (deploymentId: string, phase: string, serviceId = SERVICE_ID) => ({
+      "nouva.kind": "release_job",
+      "nouva.service.id": serviceId,
+      "nouva.deployment.id": deploymentId,
+      "nouva.release.phase": phase,
+      "nouva.release.timeout_seconds": "600",
+    });
+    const deployment = { serviceId: SERVICE_ID, deploymentId: DEPLOYMENT_ID };
+
+    test("while an earlier attempt runs, every lease gives the work back unbuilt, and the build runs once it exits", async () => {
+      const earlier = containerName("pre_activation", 1);
+      const { docker, containers } = createFakeDocker({
+        onStart: "exit_0",
+        existing: { [earlier]: running },
+        labels: { [earlier]: jobLabels(DEPLOYMENT_ID, "pre_activation") },
+      });
+      // Answers a retried job like the control plane: `wait` while any job it is told of runs.
+      const controlPlane = {
+        claim: mock(
+          async (
+            _phase: string,
+            context: { runningJobDeploymentIds: string[] }
+          ): Promise<ReleaseJobClaimResponse> =>
+            context.runningJobDeploymentIds.length > 0
+              ? { decision: "wait", attempt: 1, message: "Waiting on an earlier attempt" }
+              : { decision: "run", attempt: 2 }
+        ),
+        report: mock(async () => {}),
+      };
+      const runner = createReleasePhaseRunner({
+        docker: docker as never,
+        controlPlane,
+        clock: createClock(),
+      });
+      let builds = 0;
+      const lease = async () => {
+        await runner.deferWhileBlockingJobRuns(deployment);
+        builds += 1;
+        return runner.run(createTarget(), preActivation);
+      };
+
+      for (let leases = 0; leases < 3; leases += 1) {
+        await expect(lease()).rejects.toThrow("Waiting on an earlier attempt");
+      }
+      expect(builds).toBe(0);
+      expect(controlPlane.claim).toHaveBeenCalledWith("pre_activation", {
+        runningJobDeploymentIds: [DEPLOYMENT_ID],
+      });
+      expect(containers.get(earlier)).toMatchObject({ Running: true });
+
+      containers.set(earlier, {
+        Status: "exited",
+        Running: false,
+        ExitCode: 0,
+        StartedAt: STARTED_AT,
+        FinishedAt: "2026-09-23T10:05:00.000Z",
+      });
+      expect(await lease()).toEqual({ kind: "succeeded", attempt: 2 });
+      expect(builds).toBe(1);
+    });
+
+    test("a running job of another deployment gives the work back with the control plane's word", async () => {
+      const { docker } = createFakeDocker({
+        existing: { older_migration: running },
+        labels: { older_migration: jobLabels("dep_older", "pre_activation") },
+      });
+      const { controlPlane } = createFakeControlPlane({
+        decision: "wait",
+        attempt: 0,
+        message: "Waiting on deployment dep_olde",
+      });
+      const logs = mock((_entry: Record<string, unknown>) => {});
+      const runner = createReleasePhaseRunner({
+        docker: docker as never,
+        controlPlane,
+        clock: createClock(),
+        onBuildLog: logs,
+      });
+
+      const deferral = runner.deferWhileBlockingJobRuns(deployment);
+
+      await expect(deferral).rejects.toBeInstanceOf(ReleaseJobDeferredError);
+      expect(controlPlane.claim).toHaveBeenCalledWith("pre_activation", {
+        runningJobDeploymentIds: ["dep_older"],
+      });
+      expect(logs).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "progress", message: "Waiting on deployment dep_olde" })
+      );
+    });
+
+    test("asks nothing while no job the claim would wait on runs", async () => {
+      const { docker } = createFakeDocker({
+        existing: {
+          own_verification: running,
+          other_service: running,
+          own_exited: { Status: "exited", Running: false, ExitCode: 1 },
+        },
+        labels: {
+          own_verification: jobLabels(DEPLOYMENT_ID, "verification"),
+          other_service: jobLabels("dep_other", "pre_activation", "svc_other"),
+          own_exited: jobLabels(DEPLOYMENT_ID, "pre_activation"),
+        },
+      });
+      const { controlPlane } = createFakeControlPlane({ decision: "run", attempt: 1 });
+      const runner = createReleasePhaseRunner({
+        docker: docker as never,
+        controlPlane,
+        clock: createClock(),
+      });
+
+      await runner.deferWhileBlockingJobRuns(deployment);
+
+      expect(controlPlane.claim).not.toHaveBeenCalled();
+    });
+
+    test("a job past its own deadline is stopped and holds nothing back", async () => {
+      const { docker } = createFakeDocker({
+        existing: { older_migration: running },
+        labels: { older_migration: jobLabels("dep_older", "pre_activation") },
+      });
+      const { controlPlane } = createFakeControlPlane({ decision: "run", attempt: 1 });
+      const clock = createClock();
+      await clock.sleep(601_000);
+      const runner = createReleasePhaseRunner({ docker: docker as never, controlPlane, clock });
+
+      await runner.deferWhileBlockingJobRuns(deployment);
+
+      expect(docker.stopContainer).toHaveBeenCalledWith("older_migration", 5);
+      expect(controlPlane.claim).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      { decision: "resume" as const, attempt: 1 },
+      { decision: "skip" as const, attempt: 1 },
+      {
+        decision: "halt" as const,
+        attempt: 1,
+        status: "outcome_unknown" as const,
+        message: "Needs an operator",
+      },
+    ])("a $decision answer lets the build go on without touching the job", async (claim) => {
+      const earlier = containerName("pre_activation", 1);
+      const { docker, containers, events } = createFakeDocker({
+        existing: { [earlier]: running },
+        labels: { [earlier]: jobLabels(DEPLOYMENT_ID, "pre_activation") },
+      });
+      const { controlPlane } = createFakeControlPlane(claim, events);
+      const runner = createReleasePhaseRunner({
+        docker: docker as never,
+        controlPlane,
+        clock: createClock(),
+      });
+
+      await runner.deferWhileBlockingJobRuns(deployment);
+
+      // Nothing was changed by that claim; the one after the build acts on its answer.
+      expect(events).toEqual(["claim"]);
+      expect(containers.get(earlier)).toMatchObject({ Running: true });
+    });
+  });
 });

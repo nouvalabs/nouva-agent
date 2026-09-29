@@ -97,7 +97,16 @@ export type ReleasePhaseResult =
 
 export interface ReleasePhaseRunner {
   run(target: ReleaseJobTarget, request: ReleasePhaseRequest): Promise<ReleasePhaseResult>;
+  /**
+   * Called before a deployment with a pre-activation job builds its image. While a job container
+   * its pre-activation claim would have to wait on still runs, the claim is made now and a `wait`
+   * is thrown as a `ReleaseJobDeferredError`, so the work goes back to the queue without a build it
+   * could not use yet (#346). Otherwise it returns and the claim is made after the build as usual.
+   */
+  deferWhileBlockingJobRuns(deployment: ServiceDeployment): Promise<void>;
 }
+
+type ServiceDeployment = Pick<ReleaseJobTarget, "serviceId" | "deploymentId">;
 
 const POLL_INTERVAL_MS = 1_000;
 const STOP_GRACE_SECONDS = 5;
@@ -217,7 +226,7 @@ export function createReleasePhaseRunner(dependencies: {
     }
   }
 
-  function listServiceJobs(target: ReleaseJobTarget) {
+  function listServiceJobs(target: ServiceDeployment) {
     return docker.listContainersByLabels({
       "nouva.kind": "release_job",
       "nouva.service.id": target.serviceId,
@@ -238,7 +247,10 @@ export function createReleasePhaseRunner(dependencies: {
    * container past its own deadline is stopped first, exactly as its runner would have done had it
    * still been around; a job still inside its deadline is never touched, whoever it belongs to.
    */
-  async function readRunningJobs(target: ReleaseJobTarget, phase: ReleasePhase): Promise<string[]> {
+  async function readRunningJobs(
+    target: ServiceDeployment,
+    phase: ReleasePhase
+  ): Promise<string[]> {
     const running = new Set<string>();
     for (const container of await listServiceJobs(target)) {
       if (observeContainer(container).state !== "running") {
@@ -664,6 +676,21 @@ export function createReleasePhaseRunner(dependencies: {
         message: described,
         appliedPolicy,
       };
+    },
+
+    async deferWhileBlockingJobRuns(deployment) {
+      const runningJobDeploymentIds = await readRunningJobs(deployment, "pre_activation");
+      if (runningJobDeploymentIds.length === 0) {
+        return;
+      }
+      // Told of a running job, the control plane answers a pending job `wait`, never `run`, so this
+      // claim cannot start an attempt ahead of the build. Any other answer changes nothing, and the
+      // claim after the build gets it again.
+      const claim = await claimPhase("pre_activation", runningJobDeploymentIds);
+      if (claim.decision === "wait") {
+        progress(claim.message);
+        throw new ReleaseJobDeferredError(claim.message);
+      }
     },
   };
 }

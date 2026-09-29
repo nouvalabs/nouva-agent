@@ -39,6 +39,15 @@ const ALLOY_DATA_DIR_IN_CONTAINER = `${ALLOY_ROOT_DIR_IN_CONTAINER}/data`;
 const ALLOY_DYNAMIC_CONFIG_FILE_NAME = "redaction-context.alloy";
 const ALLOY_STATIC_CONFIG_FILE_NAME = "static.alloy";
 const ALLOY_PROBE_TIMEOUT_MS = 5_000;
+// cAdvisor dials a new containerd client, and never closes it, every time it starts watching a
+// container on a Docker host that uses the containerd image store (#329). No exporter argument
+// avoids that path without also losing every container metric, so the collector is bounded
+// instead: a leak ends in an Alloy restart, not in memory taken from the customer's workloads.
+// There is deliberately no GOMEMLIMIT under it. Leaked memory is live, so a soft limit cannot
+// reclaim it: past that limit the runtime would collect back to back for the days the leak takes
+// to reach the hard limit, burning CPU the whole time, instead of simply restarting. Alloy does not
+// derive one from this limit either: the host /sys mount hides the container's cgroup from it.
+const ALLOY_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024;
 const DOCKER_SOCKET = "/var/run/docker.sock";
 const OBSERVABILITY_NONE_LABEL_VALUE = "__none__";
 const OBSERVABILITY_DOCKER_LABELS = {
@@ -303,6 +312,17 @@ function hasExpectedRunArguments(inspection: DockerContainerInspection | null): 
   return JSON.stringify(inspection?.Config?.Cmd ?? []) === JSON.stringify(getAlloyRunArguments());
 }
 
+// A collector created without this limit, or with another one, is recreated once. Only Memory is
+// compared: Docker stores MemorySwap as -1 on hosts without swap accounting. On a host whose kernel
+// cannot enforce a memory limit at all, Docker stores the request as Memory 0 with MemorySwap -1
+// (a container created with no limit reads 0 and 0), and that pair is accepted so such a host does
+// not recreate the collector on every reconcile.
+function hasMemoryBound(inspection: DockerContainerInspection | null): boolean {
+  const memory = inspection?.HostConfig?.Memory;
+  const discardedByDocker = memory === 0 && inspection?.HostConfig?.MemorySwap === -1;
+  return memory === ALLOY_MEMORY_LIMIT_BYTES || discardedByDocker;
+}
+
 function isAlloyContainerCurrent(
   inspection: DockerContainerInspection | null,
   input: AlloyRuntimeInput,
@@ -314,6 +334,7 @@ function isAlloyContainerCurrent(
     inspection.Config?.Labels?.[ALLOY_CONFIG_HASH_LABEL] === stateHash &&
     inspection.Config.Labels[ALLOY_CONFIG_LAYOUT_LABEL] === ALLOY_CONFIG_LAYOUT_VERSION &&
     hasExpectedRunArguments(inspection) &&
+    hasMemoryBound(inspection) &&
     hasManagedContainerLogConfig(inspection) &&
     hasPortBinding(inspection, `${ALLOY_HTTP_PORT}/tcp`, {
       hostIp: ALLOY_HTTP_HOST,
@@ -653,11 +674,17 @@ ${dockerRules.join("\n")}
     drain_timeout   = "1m"
   }
 }`,
+    // Only the groups behind the API's service metrics: cpu, memory, network and block I/O
+    // (diskIO); container_start_time_seconds and container_last_seen are exported regardless.
+    // Leaving out the disk usage group also stops a filesystem walk per container.
+    // containerd_host stays at its default: on hosts using Docker's containerd image store,
+    // cAdvisor needs that socket to watch a Docker container at all.
     `prometheus.exporter.cadvisor "nouva" {
   docker_host                  = ${quote(`unix://${DOCKER_SOCKET}`)}
   docker_only                  = true
   store_container_labels       = false
   disable_root_cgroup_stats    = true
+  enabled_metrics              = ${list(["cpu", "memory", "network", "diskIO"])}
   allowlisted_container_labels = ${allowlistedLabels}
 }`,
     `prometheus.scrape "nouva_cadvisor" {
@@ -976,10 +1003,12 @@ ${dockerRules.join("\n")}
     regex  = "instance|job|service"
   }
 }`,
+    // Only the collectors behind the API's server metrics; node_boot_time_seconds comes from stat.
     `prometheus.exporter.unix "nouva" {
-  rootfs_path = ${quote("/rootfs")}
-  procfs_path = ${quote("/rootfs/proc")}
-  sysfs_path  = ${quote("/rootfs/sys")}
+  rootfs_path    = ${quote("/rootfs")}
+  procfs_path    = ${quote("/rootfs/proc")}
+  sysfs_path     = ${quote("/rootfs/sys")}
+  set_collectors = ${list(["cpu", "diskstats", "filesystem", "loadavg", "meminfo", "netdev", "stat", "uname"])}
 }`,
     `prometheus.scrape "nouva_host" {
   targets         = prometheus.exporter.unix.nouva.targets
@@ -1132,6 +1161,9 @@ export function buildAlloyContainerSpec(
       },
       LogConfig: MANAGED_CONTAINER_LOG_CONFIG,
       Privileged: true,
+      Memory: ALLOY_MEMORY_LIMIT_BYTES,
+      // Equal to Memory: no swap allowance, so the bound is not stretched into host swap.
+      MemorySwap: ALLOY_MEMORY_LIMIT_BYTES,
     },
     // Traefik's admin entrypoint is bound to the host loopback only, so the scrape has to happen
     // container-to-container. Joining the ingress network reaches `nouva-traefik:8082` on the

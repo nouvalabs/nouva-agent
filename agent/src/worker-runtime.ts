@@ -350,6 +350,13 @@ export async function waitForWorkerReadiness(
   input: {
     containerName: string;
     hasHealthcheck: boolean;
+    /**
+     * For a container that kept running up to this check, such as a live replica a scale keeps.
+     * Docker counts its restarts over its whole life, and ones it recovered from long ago say
+     * nothing about now, so only the restarts this check observes count. A candidate, or a
+     * container just started by hand (which resets the count), has no earlier ones to leave out.
+     */
+    ignoreEarlierRestarts?: boolean;
     timeoutMs?: number;
     intervalMs?: number;
     runningGraceMs?: number;
@@ -367,6 +374,7 @@ export async function waitForWorkerReadiness(
   const deadline = now() + timeoutMs;
   let runningSince: number | null = null;
   let observedRestartCount: number | null = null;
+  let restartBaseline: number | null = input.ignoreEarlierRestarts ? null : 0;
 
   while (now() <= deadline) {
     const inspection = await docker.inspectContainer(input.containerName);
@@ -380,9 +388,11 @@ export async function waitForWorkerReadiness(
     }
 
     const restartCount = inspection.RestartCount ?? 0;
-    if (restartCount >= crashLoopRestartCount) {
+    restartBaseline ??= restartCount;
+    const restartsObserved = Math.max(0, restartCount - restartBaseline);
+    if (restartsObserved >= crashLoopRestartCount) {
       throw new Error(
-        `Worker candidate ${input.containerName} is crash-looping (${restartCount} restarts)`
+        `Worker candidate ${input.containerName} is crash-looping (${restartsObserved} restarts)`
       );
     }
     if (observedRestartCount !== null && restartCount > observedRestartCount) {
@@ -399,7 +409,10 @@ export async function waitForWorkerReadiness(
       if (healthStatus === "healthy") {
         return;
       }
-    } else if (inspection.State?.Running) {
+    } else if (inspection.State?.Running && status !== "restarting") {
+      // Docker reports a container waiting out its restart back-off as running. The back-off of
+      // one that has crash-looped for a while grows to a minute, longer than the grace period, so
+      // only a started process counts.
       runningSince ??= now();
       if (now() - runningSince >= runningGraceMs) {
         return;
@@ -851,6 +864,59 @@ function recordedLiveRuntime(
   };
 }
 
+/**
+ * Whether the worker still runs as the control plane last recorded it, for a deploy that halted
+ * before touching it: at least one recorded live replica has to pass the readiness check a candidate
+ * must. Untouched is not the same as running, since the replicas may be crash-looping, often why a
+ * new version is being deployed. They have kept running, so restarts they recovered from before the
+ * check do not count against them.
+ *
+ * Never throws, because it runs while reporting another failure.
+ */
+export async function previousWorkerRuntimeRuns(
+  docker: Pick<DockerApiClient, "inspectContainer" | "listContainersByLabels">,
+  input: {
+    serviceId: string;
+    runtimeMetadata: RuntimeMetadata | null | undefined;
+    clock?: WorkerShutdownClock;
+  }
+): Promise<boolean> {
+  const clock = input.clock ?? SYSTEM_WORKER_SHUTDOWN_CLOCK;
+  let replicas: DockerContainerInspection[];
+  try {
+    replicas = (await listWorkerServiceContainers(docker, input.serviceId)).filter(
+      recordedLiveRuntime(input.runtimeMetadata)
+    );
+  } catch (error) {
+    // Claiming a live runtime that cannot be confirmed would mark the service running.
+    console.warn(`Failed to list the replicas of worker ${input.serviceId}`, error);
+    return false;
+  }
+  // Side by side, so replicas that are not running cost one readiness timeout, not one each.
+  const running = await Promise.all(
+    replicas.map(async (replica) => {
+      try {
+        await waitForWorkerReadiness(docker, {
+          containerName: getContainerName(replica),
+          hasHealthcheck: Boolean(replica.State?.Health),
+          ignoreEarlierRestarts: true,
+          now: clock.now,
+          wait: clock.wait,
+        });
+        return true;
+      } catch (error) {
+        // Not running is the answer, not a failure.
+        console.warn(
+          `Worker replica ${getContainerName(replica)} is not running`,
+          error instanceof Error ? error.message : error
+        );
+        return false;
+      }
+    })
+  );
+  return running.includes(true);
+}
+
 async function assertContainersAbsent(
   docker: Pick<DockerApiClient, "inspectContainer">,
   identifiers: string[]
@@ -881,6 +947,8 @@ async function assertContainersStopped(
  * whatever stop settings it was created with, so starting it as-is would leave a worker that never
  * comes back after a crash or reboot. A running one keeps running, but gets `unless-stopped` back
  * in case an interrupted graceful stop had already switched it off.
+ *
+ * Returns whether the slot kept a running container.
  */
 async function prepareCandidateSlot(
   docker: Pick<
@@ -888,18 +956,19 @@ async function prepareCandidateSlot(
     "inspectContainer" | "removeContainer" | "updateContainerRestartPolicy"
   >,
   containerName: string
-): Promise<void> {
+): Promise<boolean> {
   const existing = await docker.inspectContainer(containerName);
   if (!existing) {
-    return;
+    return false;
   }
   const identifier = getContainerIdentifier(existing);
   if (existing.State?.Running) {
     await docker.updateContainerRestartPolicy(identifier, "unless-stopped");
-    return;
+    return true;
   }
   await docker.removeContainer(identifier, false);
   await assertContainersAbsent(docker, [identifier]);
+  return false;
 }
 
 export interface DeployWorkerRuntimeOptions {
@@ -1206,10 +1275,22 @@ export async function deployWorkerRuntime(
     }
   }
 
+  // A candidate slot that already runs a replica of the live runtime is adopted as it is, like the
+  // replicas a scale-up keeps. It was serving before this attempt, so a failed attempt leaves it
+  // running: only the candidates the attempt started itself are its to discard.
+  const adoptedLiveReplicas = new Map(
+    (plan.order === "candidate_first" ? pick(candidateNames) : [])
+      .filter((container) => container.State?.Running === true && isRecordedLive(container))
+      .map((container) => [getContainerName(container), container])
+  );
   const candidateIds = new Map<string, string>();
   try {
     for (const candidate of candidateSpecs) {
-      await prepareCandidateSlot(docker, candidate.containerName);
+      if (!(await prepareCandidateSlot(docker, candidate.containerName))) {
+        // A live replica that stopped since the rollout listed it was just replaced, so the
+        // container now in its slot is this attempt's.
+        adoptedLiveReplicas.delete(candidate.containerName);
+      }
       const id = await docker.ensureContainer(candidate.spec, false, { pull: false });
       candidateIds.set(candidate.containerName, id);
     }
@@ -1217,6 +1298,7 @@ export async function deployWorkerRuntime(
       await waitForWorkerReadiness(docker, {
         containerName: candidate.containerName,
         hasHealthcheck: candidate.hasHealthcheck,
+        ignoreEarlierRestarts: adoptedLiveReplicas.has(candidate.containerName),
         now: clock.now,
         wait: clock.wait,
       });
@@ -1225,12 +1307,15 @@ export async function deployWorkerRuntime(
       progress(`New worker container(s) ready: ${candidateNames.join(", ")}`);
     }
   } catch (error) {
-    const candidatesStopped = await discardFailedCandidates(candidateNames);
+    const candidatesStopped = await discardFailedCandidates(
+      candidateNames.filter((name) => !adoptedLiveReplicas.has(name))
+    );
+    const untouchedContainers = [...adoptedLiveReplicas.values(), ...retiredContainers];
 
     // Only a container running now preserves the service: a recorded-live one that was already
     // stopped when this rollout began is in `retiredContainers` but runs nothing.
     let liveRuntimePreserved =
-      plan.order === "candidate_first" && (await anyContainerRunning(docker, retiredContainers));
+      plan.order === "candidate_first" && (await anyContainerRunning(docker, untouchedContainers));
     let rollbackCompleted = false;
     let keptSnapshot: string | null = null;
     if (plan.order === "stop_first") {
@@ -1306,7 +1391,7 @@ export async function deployWorkerRuntime(
         currentPhase: plan.order === "stop_first" ? "restore" : "ready",
         liveRuntimePreserved,
         rollbackCompleted,
-        activeContainerNames: [...previousContainers, ...retiredContainers].map(getContainerName),
+        activeContainerNames: [...previousContainers, ...untouchedContainers].map(getContainerName),
       })
     );
   }
@@ -1360,7 +1445,13 @@ export async function deployWorkerRuntime(
   ) {
     const retainedReference = retainedPreviousImage.reference || retainedPreviousImage.imageId;
     if (retainedReference) {
-      await docker.removeImage(retainedReference, true);
+      try {
+        await docker.removeImage(retainedReference, true);
+      } catch (error) {
+        // An image left behind only costs disk; failing here would report the live version as
+        // broken and leave the control plane recording the old one as live.
+        console.warn(`Failed to remove the retired worker image ${retainedReference}`, error);
+      }
     }
   }
 

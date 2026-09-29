@@ -11,10 +11,12 @@ import {
   cleanupWorkerJob,
   deployWorkerRuntime,
   inspectWorkerJob,
+  previousWorkerRuntimeRuns,
   removeWorkerServiceRuntime,
   restartWorkerServiceRuntime,
   startWorkerJob,
   WorkerRolloutError,
+  type WorkerRolloutResult,
   waitForWorkerReadiness,
 } from "./worker-runtime.js";
 
@@ -403,6 +405,68 @@ describe("worker readiness", () => {
         hasHealthcheck: true,
       })
     ).rejects.toThrow("became unhealthy");
+  });
+
+  /** A container whose `RestartCount` goes through `counts`, repeating the last one. */
+  function restartingContainer(counts: number[], state: DockerContainerInspection["State"]) {
+    let inspections = 0;
+    return {
+      inspectContainer: mock(async () => ({
+        Id: "ctr_1",
+        Name: "nouva-worker-svc_1-dep_1-0",
+        RestartCount: counts[Math.min(inspections++, counts.length - 1)],
+        State: state,
+      })),
+    };
+  }
+
+  function checkReadiness(
+    docker: ReturnType<typeof restartingContainer>,
+    input: { hasHealthcheck: boolean; ignoreEarlierRestarts: boolean }
+  ) {
+    let now = 0;
+    return waitForWorkerReadiness(docker as never, {
+      containerName: "nouva-worker-svc_1-dep_1-0",
+      ...input,
+      now: () => now,
+      wait: async (ms) => {
+        now += ms;
+      },
+    });
+  }
+
+  test("leaves out the restarts a live replica recovered from before the check", async () => {
+    const docker = restartingContainer([5], {
+      Running: true,
+      Status: "running",
+      Health: { Status: "healthy" },
+    });
+
+    await expect(
+      checkReadiness(docker, { hasHealthcheck: true, ignoreEarlierRestarts: true })
+    ).resolves.toBeUndefined();
+    // A candidate has no earlier life to leave out: every restart it has, its rollout saw.
+    await expect(
+      checkReadiness(docker, { hasHealthcheck: true, ignoreEarlierRestarts: false })
+    ).rejects.toThrow("is crash-looping (5 restarts)");
+  });
+
+  test("still fails a live replica that keeps restarting during the check", async () => {
+    const docker = restartingContainer([5, 6, 7, 8], { Running: true, Status: "running" });
+
+    await expect(
+      checkReadiness(docker, { hasHealthcheck: false, ignoreEarlierRestarts: true })
+    ).rejects.toThrow("is crash-looping (3 restarts)");
+  });
+
+  test("does not count a container waiting out its restart back-off as running", async () => {
+    // How Docker reports a container between two automatic restarts; after a while of crash
+    // looping, it stays like this for up to a minute each time.
+    const docker = restartingContainer([12], { Running: true, Status: "restarting", ExitCode: 1 });
+
+    await expect(
+      checkReadiness(docker, { hasHealthcheck: false, ignoreEarlierRestarts: true })
+    ).rejects.toThrow("did not remain running");
   });
 });
 
@@ -1531,6 +1595,41 @@ describe("worker rollouts around stopped leftovers", () => {
     );
   });
 
+  test("completes the rollout when removing the retired previous image fails", async () => {
+    const fake = createRuntimeDocker();
+    const liveMetadata = await deployLive(fake, release("dep_2", 1));
+    const retiredImage = "registry.example/nouva-worker:dep_1";
+    const runtimeMetadata = {
+      ...liveMetadata,
+      previousImage: {
+        reference: retiredImage,
+        imageId: "img_worker_dep_1",
+        deploymentId: "dep_1",
+        commitHash: "abc123",
+      },
+    };
+    fake.docker.removeImage.mockImplementation(async () => {
+      throw new Error("Docker API 500 on image removal");
+    });
+
+    const result = await deployWorkerRuntime(
+      fake.docker as never,
+      environment,
+      { ...release("dep_3", 1), runtimeMetadata },
+      { clock: fake.clock }
+    );
+
+    expect(fake.docker.removeImage).toHaveBeenCalledWith(retiredImage, true);
+    expect(fake.containers.get(replicaName("dep_3", 0))?.State?.Running).toBe(true);
+    expect(result.rollout).toEqual(expect.objectContaining({ outcome: "committed" }));
+    expect(result.runtimeMetadata).toEqual(
+      expect.objectContaining({
+        currentImage: expect.objectContaining({ deploymentId: "dep_3" }),
+        previousImage: expect.objectContaining({ deploymentId: "dep_2" }),
+      })
+    );
+  });
+
   test("restarts a previous worker whose stop Docker could not confirm", async () => {
     const fake = createRuntimeDocker();
     const runtimeMetadata = await deployLive(fake, release("dep_1", 1));
@@ -1665,6 +1764,115 @@ describe("worker rollouts around stopped leftovers", () => {
     );
   });
 
+  /** Makes every container ensureContainer creates exit at once; running ones are adopted. */
+  function crashNewContainers(fake: ReturnType<typeof createRuntimeDocker>): void {
+    const ensure = fake.docker.ensureContainer.getMockImplementation();
+    fake.docker.ensureContainer.mockImplementation(async (spec: DockerContainerSpec) => {
+      if (fake.containers.has(spec.name)) {
+        return (await ensure?.(spec)) ?? "";
+      }
+      fake.events.push(`start ${spec.name}`);
+      fake.containers.set(spec.name, {
+        Id: `ctr_crashing_${spec.name}`,
+        Name: spec.name,
+        Config: { Image: spec.image, Labels: spec.labels },
+        State: { Running: false, Status: "exited", ExitCode: 1 },
+      });
+      return `ctr_crashing_${spec.name}`;
+    });
+  }
+
+  test("a scale-up whose new replica fails readiness keeps the live replicas running", async () => {
+    const fake = createRuntimeDocker();
+    const runtimeMetadata = await deployLive(fake, release("dep_1", 2));
+    const live = [0, 1].map((index) => replicaName("dep_1", index));
+    const liveIds = live.map((name) => fake.containers.get(name)?.Id);
+    const added = replicaName("dep_1", 2);
+    crashNewContainers(fake);
+    fake.events.length = 0;
+
+    const failure = await deployWorkerRuntime(
+      fake.docker as never,
+      environment,
+      { ...release("dep_1", 3), runtimeMetadata },
+      { clock: fake.clock }
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(WorkerRolloutError);
+    expect(live.map((name) => fake.containers.get(name)?.Id)).toEqual(liveIds);
+    for (const name of live) {
+      expect(fake.containers.get(name)?.State?.Running).toBe(true);
+      expect(fake.events).not.toContain(`SIGTERM ${name}`);
+    }
+    expect(fake.containers.has(added)).toBe(false);
+    const rollout = (failure as WorkerRolloutError).result.rollout as WorkerRolloutResult;
+    expect(rollout).toEqual(
+      expect.objectContaining({
+        outcome: "aborted_before_cutover",
+        liveRuntimePreserved: true,
+        activeContainerNames: live,
+      })
+    );
+    expect(rollout.shutdowns.map((report) => report.containerName)).toEqual([added]);
+  });
+
+  test("discards a live replica's replacement when the replica stopped mid-rollout", async () => {
+    const fake = createRuntimeDocker();
+    const runtimeMetadata = await deployLive(fake, release("dep_1", 2));
+    const [kept, stopped] = [0, 1].map((index) => replicaName("dep_1", index));
+    // The listing still shows the replica running; it exits before its slot is prepared.
+    const listed = structuredClone([...fake.containers.values()]);
+    fake.docker.listContainersByLabels.mockImplementation(async () => listed);
+    await fake.docker.killContainer(stopped as string, "SIGTERM");
+    crashNewContainers(fake);
+
+    const failure = await deployWorkerRuntime(
+      fake.docker as never,
+      environment,
+      { ...release("dep_1", 2), runtimeMetadata },
+      { clock: fake.clock }
+    ).catch((error: unknown) => error);
+
+    expect(fake.containers.get(kept as string)?.State?.Running).toBe(true);
+    expect(fake.containers.has(stopped as string)).toBe(false);
+    expect((failure as WorkerRolloutError).result.rollout).toEqual(
+      expect.objectContaining({ liveRuntimePreserved: true, activeContainerNames: [kept] })
+    );
+  });
+
+  test("a failed retry still discards the candidates an interrupted attempt started", async () => {
+    const fake = createRuntimeDocker();
+    const overlap = { ...noOverlap, rolloutPolicy: "overlap" } as const;
+    const runtimeMetadata = await deployLive(fake, release("dep_1", 1, overlap));
+    const previous = replicaName("dep_1", 0);
+    const interrupted = replicaName("dep_2", 0);
+    // The interrupted attempt started the new version's first replica and died.
+    await fake.docker.ensureContainer(
+      buildWorkerContainerSpec({
+        environment,
+        payload: release("dep_2", 2, overlap),
+        image: workerImage,
+        replicaIndex: 0,
+      }).spec
+    );
+    crashNewContainers(fake);
+    fake.events.length = 0;
+
+    const failure = await deployWorkerRuntime(
+      fake.docker as never,
+      environment,
+      { ...release("dep_2", 2, overlap), runtimeMetadata },
+      { clock: fake.clock }
+    ).catch((error: unknown) => error);
+
+    expect(fake.events).toContain(`SIGTERM ${interrupted}`);
+    expect(fake.containers.has(interrupted)).toBe(false);
+    expect(fake.containers.get(previous)?.State?.Running).toBe(true);
+    expect((failure as WorkerRolloutError).result.rollout).toEqual(
+      expect.objectContaining({ liveRuntimePreserved: true, activeContainerNames: [previous] })
+    );
+  });
+
   test("reports the untouched previous version as preserved when a stale candidate hangs", async () => {
     const fake = createRuntimeDocker();
     const volume = { volumeId: "vol_1", volumeName: "nouva-vol-1", mountPath: "/data" };
@@ -1746,6 +1954,123 @@ describe("worker rollouts around stopped leftovers", () => {
         ),
       })
     );
+  });
+
+  test("a scale-up keeps a live replica that recovered from restarts before the rollout", async () => {
+    const fake = createRuntimeDocker();
+    const runtimeMetadata = await deployLive(fake, release("dep_1", 1));
+    const live = replicaName("dep_1", 0);
+    const liveContainer = fake.containers.get(live) as DockerContainerInspection;
+    // Its restart policy brought it back three times, days ago (out-of-memory kills, say).
+    liveContainer.RestartCount = 3;
+    fake.events.length = 0;
+
+    const result = await deployWorkerRuntime(
+      fake.docker as never,
+      environment,
+      { ...release("dep_1", 2), runtimeMetadata },
+      { clock: fake.clock }
+    );
+
+    expect(result.rollout).toEqual(
+      expect.objectContaining({
+        outcome: "committed",
+        activeContainerNames: [live, replicaName("dep_1", 1)],
+      })
+    );
+    expect(fake.containers.get(live)?.Id).toBe(liveContainer.Id);
+    expect(fake.events).not.toContain(`SIGTERM ${live}`);
+  });
+
+  describe("whether the previous runtime still runs when a deploy halts before touching it", () => {
+    async function liveReplicas(fake: ReturnType<typeof createRuntimeDocker>) {
+      const runtimeMetadata = await deployLive(fake, release("dep_1", 2));
+      const replica = (index: number) =>
+        fake.containers.get(replicaName("dep_1", index)) as DockerContainerInspection;
+      return { runtimeMetadata, first: replica(0), second: replica(1) };
+    }
+
+    const previousRuns = (
+      fake: ReturnType<typeof createRuntimeDocker>,
+      runtimeMetadata: WorkerDeployOnlyPayload["runtimeMetadata"]
+    ) =>
+      previousWorkerRuntimeRuns(fake.docker as never, {
+        serviceId: "svc_1",
+        runtimeMetadata,
+        clock: fake.clock,
+      });
+
+    test("counts live replicas that recovered from restarts before the check", async () => {
+      const fake = createRuntimeDocker();
+      const { runtimeMetadata, first, second } = await liveReplicas(fake);
+      first.RestartCount = 4;
+      second.RestartCount = 4;
+
+      expect(await previousRuns(fake, runtimeMetadata)).toBe(true);
+    });
+
+    const notRunning: Array<[string, (replica: DockerContainerInspection) => void]> = [
+      [
+        "waiting out a crash loop's restart back-off",
+        (replica) => {
+          replica.RestartCount = 40;
+          replica.State = { Running: true, Status: "restarting", ExitCode: 1 };
+        },
+      ],
+      [
+        "failing its health check",
+        (replica) => {
+          replica.State = { Running: true, Status: "running", Health: { Status: "unhealthy" } };
+        },
+      ],
+      [
+        "stopped",
+        (replica) => {
+          replica.State = { Running: false, Status: "exited", ExitCode: 137 };
+        },
+      ],
+    ];
+
+    test.each(notRunning)("does not count a live replica that is %s", async (_, breakReplica) => {
+      const fake = createRuntimeDocker();
+      const { runtimeMetadata, first, second } = await liveReplicas(fake);
+      breakReplica(first);
+      breakReplica(second);
+
+      expect(await previousRuns(fake, runtimeMetadata)).toBe(false);
+    });
+
+    test("counts the runtime as running while one of its replicas runs", async () => {
+      const fake = createRuntimeDocker();
+      const { runtimeMetadata, first } = await liveReplicas(fake);
+      first.State = { Running: true, Status: "restarting", ExitCode: 1 };
+
+      expect(await previousRuns(fake, runtimeMetadata)).toBe(true);
+    });
+
+    test("does not count a running container outside the recorded runtime", async () => {
+      const fake = createRuntimeDocker();
+      const { runtimeMetadata, first, second } = await liveReplicas(fake);
+      first.State = { Running: false, Status: "exited", ExitCode: 137 };
+      second.State = { Running: false, Status: "exited", ExitCode: 137 };
+      // An older version's replica that outlived its retirement.
+      const older = fake.containers.get(
+        addStoppedLeftover(fake, "dep_0")
+      ) as DockerContainerInspection;
+      older.State = { Running: true, Status: "running" };
+
+      expect(await previousRuns(fake, runtimeMetadata)).toBe(false);
+    });
+
+    test("does not count a runtime whose replicas cannot be listed", async () => {
+      const fake = createRuntimeDocker();
+      const { runtimeMetadata } = await liveReplicas(fake);
+      fake.docker.listContainersByLabels.mockImplementation(async () => {
+        throw new Error("Docker daemon unavailable");
+      });
+
+      expect(await previousRuns(fake, runtimeMetadata)).toBe(false);
+    });
   });
 });
 

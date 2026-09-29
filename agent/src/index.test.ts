@@ -14,8 +14,10 @@ import { DockerApiError, type DockerContainerSpec } from "./docker-api.js";
 import {
   ApiRequestError,
   adoptReregisteredCredentials,
+  buildAgentUpdaterContainerSpec,
   buildAgentWorkFailureReport,
   buildAppContainerSpec,
+  buildAppVolumeSnapshotName,
   buildDatabaseContainerSpec,
   buildExternalBackupImportFetchScript,
   buildPostgresExternalBackupImportScript,
@@ -24,6 +26,8 @@ import {
   createAgentHeartbeatLoop,
   deployAppImageWithDependencies,
   handleApplyDatabaseVolume,
+  handleBuildAndDeployApp,
+  handleBuildAndDeployWorker,
   handleCreateVolumeBackup,
   handleDatabaseProvision,
   handleDeleteProject,
@@ -36,6 +40,7 @@ import {
   handleRestoreVolumeBackup,
   handleWipeVolume,
   isAgentWorkResultRejected,
+  lookupPublicIp,
   parseExternalBackupImportObservation,
   preflightDatabasePublicPort,
   prepareAppBuildkitRuntime,
@@ -59,6 +64,7 @@ import {
   type DatabaseProvisionPayload,
   type RestoreVolumeBackupPayload,
   resolveAppRolloutConfig,
+  type WorkerDeployPayload,
 } from "./protocol.js";
 import {
   ReleaseJobDeferredError,
@@ -66,6 +72,7 @@ import {
   type ReleaseJobTarget,
   type ReleasePhaseRequest,
   type ReleasePhaseResult,
+  type ReleasePhaseRunner,
 } from "./release-jobs.js";
 
 const runtimeConfig: AgentRuntimeConfig = {
@@ -492,9 +499,105 @@ describe("agent version reporting", () => {
         "NOUVA_AGENT_IMAGE=ghcr.io/nouvalabs/nouva-agent:latest",
         "NOUVA_AGENT_TARGET_IMAGE=ghcr.io/nouvalabs/nouva-agent:latest",
       ],
-      envInheritFlags:
-        "-e NOUVA_AGENT_DATA_VOLUME -e NOUVA_API_URL -e NOUVA_SERVER_ID -e NOUVA_AGENT_IMAGE -e NOUVA_AGENT_TARGET_IMAGE",
+      envInheritArgs: [
+        "-e",
+        "NOUVA_AGENT_DATA_VOLUME",
+        "-e",
+        "NOUVA_API_URL",
+        "-e",
+        "NOUVA_SERVER_ID",
+        "-e",
+        "NOUVA_AGENT_IMAGE",
+        "-e",
+        "NOUVA_AGENT_TARGET_IMAGE",
+      ],
     });
+  });
+
+  test("the updater passes a hostile image ref to docker as one argument, never as shell", async () => {
+    const workDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-updater-"));
+    try {
+      const binDir = path.join(workDir, "bin");
+      const callsFile = path.join(workDir, "calls");
+      const pwnedFile = path.join(workDir, "pwned");
+      await mkdir(binDir);
+      // Records each docker invocation with one argument per line.
+      await writeFile(
+        path.join(binDir, "docker"),
+        `#!/bin/sh\nfor arg in "$@"; do printf '%s\\n' "$arg" >> "${callsFile}"; done\necho --- >> "${callsFile}"\n`,
+        { mode: 0o755 }
+      );
+      const hostileImage = `evil"; touch ${pwnedFile}; echo "$(touch ${pwnedFile})`;
+      const spec = buildAgentUpdaterContainerSpec(
+        { NOUVA_AGENT_DATA_VOLUME: "nouva-agent-data", NOUVA_SERVER_ID: "srv_1" },
+        hostileImage
+      );
+
+      expect(spec.name).toBe("nouva-agent-updater");
+      expect(spec.hostConfig).toMatchObject({ AutoRemove: true });
+      const [shell, flag, script, ...argv] = spec.cmd ?? [];
+      expect(shell).toBe("sh");
+      expect(flag).toBe("-c");
+      expect(script).not.toContain(hostileImage);
+
+      const env = Object.fromEntries(
+        (spec.env ?? []).map((entry) => {
+          const separator = entry.indexOf("=");
+          return [entry.slice(0, separator), entry.slice(separator + 1)];
+        })
+      );
+      const child = Bun.spawnSync(["sh", "-c", script ?? "", ...argv], {
+        env: { ...env, PATH: `${binDir}:/usr/bin:/bin` },
+      });
+      expect(child.exitCode).toBe(0);
+
+      const invocations = (await readFile(callsFile, "utf8"))
+        .split("---\n")
+        .filter((call) => call.length > 0)
+        .map((call) => call.trimEnd().split("\n"));
+      expect(invocations[0]).toEqual(["stop", "nouva-agent"]);
+      expect(invocations[1]).toEqual(["rm", "nouva-agent"]);
+      const run = invocations[2] ?? [];
+      expect(run.slice(0, 4)).toEqual(["run", "-d", "--name", "nouva-agent"]);
+      expect(run).toContain("nouva-agent-data:/var/lib/nouva-agent");
+      expect(run).toContain("NOUVA_SERVER_ID");
+      expect(run.at(-1)).toBe(hostileImage);
+      expect(await Bun.file(pwnedFile).exists()).toBe(false);
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("lookupPublicIp", () => {
+  let warnSpy: ReturnType<typeof spyOn>;
+  beforeEach(() => {
+    warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  test("returns the reported address", async () => {
+    const fetchImpl = (async () => Response.json({ ip: "203.0.113.7" })) as unknown as typeof fetch;
+    expect(await lookupPublicIp(fetchImpl)).toBe("203.0.113.7");
+  });
+
+  test("gives up on a lookup that never answers and logs why", async () => {
+    const fetchImpl = ((_url: string, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+      })) as unknown as typeof fetch;
+
+    expect(await lookupPublicIp(fetchImpl, 20)).toBeNull();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("reports no address for an error response", async () => {
+    const fetchImpl = (async () =>
+      new Response("down", { status: 503 })) as unknown as typeof fetch;
+    expect(await lookupPublicIp(fetchImpl)).toBeNull();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -700,6 +803,36 @@ describe("agent work mutation errors", () => {
     expect(() =>
       sanitizeAgentWorkResult(
         { rollout: { ...rollout, shutdowns: [{ ...shutdown, containerName: `nouva-${secret}` }] } },
+        { ...customerVariables, SENTINEL_PRIVATE_NAME: secret }
+      )
+    ).toThrow("Agent work result conflicts with protected environment material");
+  });
+
+  test("keeps a rollout's strategy, outcome and phase when a customer value equals them", () => {
+    // Regression for #345: `DEPLOY_STATE=committed` rejected every completed rollout.
+    const rollout = {
+      strategy: "candidate_ready_cutover",
+      outcome: "committed",
+      currentPhase: "retire",
+      liveRuntimePreserved: true,
+      rollbackCompleted: false,
+      previousContainerRetirement: "graceful",
+      activeContainerName: "nouva-proj-app-dep_1",
+      candidateContainerName: "nouva-proj-app-dep_1",
+    };
+    const customerVariables = {
+      DEPLOY_STATE: "committed",
+      SHUTDOWN_MODE: "graceful",
+      LIFECYCLE_PHASE: "retire",
+      ROLLOUT_STRATEGY: "candidate_ready_cutover",
+    };
+
+    expect(sanitizeAgentWorkResult({ rollout }, customerVariables)).toEqual({ rollout });
+
+    const secret = "sentinel-private-value";
+    expect(() =>
+      sanitizeAgentWorkResult(
+        { rollout: { ...rollout, candidateContainerName: `nouva-${secret}` } },
         { ...customerVariables, SENTINEL_PRIVATE_NAME: secret }
       )
     ).toThrow("Agent work result conflicts with protected environment material");
@@ -1524,6 +1657,92 @@ describe("buildAndDeployAppWithDependencies", () => {
         resourceLimits: appPayload.resourceLimits,
       })
     );
+  });
+});
+
+describe("build and deploy with a pre-activation job to wait on (#346)", () => {
+  const preActivation = { command: "bun run migrate", timeoutSeconds: 600 };
+  const workerPayload: WorkerDeployPayload = {
+    repoUrl: appPayload.repoUrl,
+    commitHash: appPayload.commitHash,
+    commitMessage: appPayload.commitMessage,
+    branch: appPayload.branch,
+    serviceName: "worker",
+    projectId: "proj_1",
+    serviceId: "svc_1",
+    deploymentId: "dep_1",
+    envVars: {},
+    startCommand: "bun run worker",
+    healthCheckCommand: null,
+    replicaCount: 1,
+    resourceLimits,
+  };
+  const deploy = (
+    kind: "app" | "worker",
+    docker: ReturnType<typeof createDockerMock>,
+    releaseJobs: AppDeployPayload["releaseJobs"],
+    releasePhases: ReleasePhaseRunner
+  ) =>
+    kind === "app"
+      ? handleBuildAndDeployApp(
+          docker as never,
+          runtimeConfig,
+          { ...appPayload, releaseJobs },
+          undefined,
+          releasePhases
+        )
+      : handleBuildAndDeployWorker(
+          docker as never,
+          runtimeConfig,
+          { ...workerPayload, releaseJobs },
+          undefined,
+          releasePhases
+        );
+
+  test.each([
+    "app",
+    "worker",
+  ] as const)("a %s deploy told to wait is given back before BuildKit is prepared", async (kind) => {
+    const docker = createDockerMock();
+    const deferral = new ReleaseJobDeferredError("Waiting on an earlier attempt");
+    const releasePhases = {
+      run: mock(async (): Promise<ReleasePhaseResult> => ({ kind: "succeeded", attempt: 1 })),
+      deferWhileBlockingJobRuns: mock(async () => {
+        throw deferral;
+      }),
+    };
+
+    await expect(
+      deploy(kind, docker, { preActivation, verification: null }, releasePhases)
+    ).rejects.toBe(deferral);
+
+    expect(releasePhases.deferWhileBlockingJobRuns).toHaveBeenCalledWith(
+      expect.objectContaining({ serviceId: "svc_1", deploymentId: "dep_1" })
+    );
+    expect(docker.createVolume).not.toHaveBeenCalled();
+    expect(docker.ensureContainer).not.toHaveBeenCalled();
+    expect(releasePhases.run).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    "app",
+    "worker",
+  ] as const)("a %s deploy without a pre-activation job never claims one", async (kind) => {
+    const docker = createDockerMock();
+    docker.createVolume.mockImplementation(async () => {
+      throw new Error("preparing BuildKit");
+    });
+    const releasePhases = {
+      run: mock(async (): Promise<ReleasePhaseResult> => ({ kind: "succeeded", attempt: 1 })),
+      deferWhileBlockingJobRuns: mock(async () => {}),
+    };
+    const verification = { command: "true", timeoutSeconds: 30, onFailure: "keep" as const };
+
+    await expect(
+      deploy(kind, docker, { preActivation: null, verification }, releasePhases)
+    ).rejects.toThrow("preparing BuildKit");
+
+    expect(releasePhases.deferWhileBlockingJobRuns).not.toHaveBeenCalled();
   });
 });
 
@@ -2383,6 +2602,64 @@ describe("deployAppImageWithDependencies", () => {
     );
   });
 
+  test("keeps a committed rollout when the image it retires cannot be removed", async () => {
+    const docker = createDockerMock();
+    docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    docker.inspectImage.mockImplementation(async () => ({ Id: "img_candidate" }));
+    docker.removeImage.mockRejectedValue(new Error("Docker API 500 on image removal"));
+    docker.inspectContainer.mockImplementation(async (name: string) =>
+      name === "nouva-app-svc_1-dep_1"
+        ? {
+            Id: "ctr_candidate",
+            Name: name,
+            State: { Running: true },
+            NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.10" } } },
+          }
+        : null
+    );
+    const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const result = await deployAppImageWithDependencies(
+      {
+        ensureBaseRuntime: async () => undefined,
+        checkTcpConnect: mock(async () => true),
+        fetchImpl: mock(async () =>
+          Response.json([
+            {
+              name: "svc-svc_1@file",
+              loadBalancer: { servers: [{ url: "http://nouva-app-svc_1-dep_1:8080" }] },
+            },
+          ])
+        ) as unknown as typeof fetch,
+        writeLocalTraefikRoute: mock(async () => {}),
+        deleteLocalTraefikRoute: mock(async () => {}),
+        sleep: mock(async () => undefined),
+      },
+      docker as never,
+      runtimeConfig,
+      {
+        ...appRuntimePayload,
+        volume: null,
+        rollout: createRolloutConfig(),
+        runtimeMetadata: {
+          containerName: "nouva-app-svc_1-live",
+          currentImage: { reference: "nouva-app:dep_prev", imageId: "img_prev" },
+          previousImage: { reference: "nouva-app:dep_older", imageId: "img_older" },
+          internalPort: 8080,
+        },
+      }
+    ).finally(() => warn.mockRestore());
+
+    expect(docker.removeImage).toHaveBeenCalledWith("nouva-app:dep_older", true);
+    expect(result.rollout.outcome).toBe("committed");
+    expect(result.runtimeMetadata).toEqual(
+      expect.objectContaining({
+        currentImage: expect.objectContaining({ reference: appRuntimePayload.imageUrl }),
+        previousImage: expect.objectContaining({ reference: "nouva-app:dep_prev" }),
+      })
+    );
+  });
+
   describe("release phases", () => {
     const candidateName = "nouva-app-svc_1-dep_1";
     const liveName = "nouva-app-svc_1-live";
@@ -2489,6 +2766,43 @@ describe("deployAppImageWithDependencies", () => {
       expect(dependencies.writeLocalTraefikRoute).not.toHaveBeenCalled();
     });
 
+    test("a failed pre-activation job does not report a crash-looping live deployment as serving", async () => {
+      const { docker, dependencies, payload, runner } = releaseFixture({
+        preActivation: { command: "bun run migrate", timeoutSeconds: 60 },
+        verification: null,
+      });
+      docker.inspectContainer.mockImplementation(async (name: string) =>
+        name === liveName
+          ? ({
+              Id: "ctr_live",
+              Name: liveName,
+              RestartCount: 4,
+              State: { Running: false, Status: "restarting", ExitCode: 1, OOMKilled: false },
+            } as never)
+          : null
+      );
+      const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const error = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        runner({ pre_activation: failed("pre_activation") })
+      )
+        .catch((caught: unknown) => caught)
+        .finally(() => warn.mockRestore());
+
+      expect(error).toBeInstanceOf(ReleaseJobHaltError);
+      expect((error as ReleaseJobHaltError).message).toBe("The pre_activation job failed");
+      expect((error as ReleaseJobHaltError).result.rollout).toMatchObject({
+        outcome: "aborted_before_cutover",
+        liveRuntimePreserved: false,
+        activeContainerName: liveName,
+      });
+      expect(docker.ensureContainer).not.toHaveBeenCalled();
+    });
+
     const rolledBackRelease = {
       preActivation: { command: "bun run migrate", timeoutSeconds: 60 },
       verification: verify("rollback"),
@@ -2573,6 +2887,60 @@ describe("deployAppImageWithDependencies", () => {
         docker.removeContainer.mock.invocationCallOrder[0]!
       );
       expect(runs).toEqual([]);
+    });
+
+    test.each([
+      false,
+      true,
+    ])("a release an earlier run rolled back removes its image unless it is retained (retained=%s)", async (retained) => {
+      const { docker, dependencies, payload, runner } = releaseFixture(rolledBackRelease);
+      leaveCandidateRunning(docker);
+      if (retained) {
+        // The service already runs this image, e.g. a redeploy of the live release's image.
+        payload.runtimeMetadata = { ...payload.runtimeMetadata, image: payload.imageUrl };
+      }
+
+      const error = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        runner({})
+      ).catch((caught: unknown) => caught);
+
+      expect(haltedRollout(error)).toMatchObject({ outcome: "aborted_before_cutover" });
+      if (retained) {
+        expect(docker.removeImage).not.toHaveBeenCalled();
+      } else {
+        expect(docker.removeImage).toHaveBeenCalledWith(payload.imageUrl, true);
+      }
+    });
+
+    test("a release an earlier run rolled back still halts when its image cannot be removed", async () => {
+      const { docker, dependencies, payload, runner } = releaseFixture(rolledBackRelease);
+      leaveCandidateRunning(docker);
+      docker.removeImage.mockRejectedValue(
+        new Error("conflict: unable to delete image (must be forced) - image is being used")
+      );
+      const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const error = await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        payload,
+        runner({})
+      )
+        .catch((caught: unknown) => caught)
+        .finally(() => warn.mockRestore());
+
+      expect(haltedRollout(error)).toMatchObject({
+        outcome: "aborted_before_cutover",
+        liveRuntimePreserved: true,
+        rollbackCompleted: true,
+        activeContainerName: liveName,
+      });
+      expect(docker.removeImage).toHaveBeenCalledWith(payload.imageUrl, true);
     });
 
     test("a rejected release keeps serving only when the previous one cannot", async () => {
@@ -2697,6 +3065,41 @@ describe("deployAppImageWithDependencies", () => {
       expect(target?.networkName).toBe(docker.ensureNetwork.mock.calls[0]?.[0] as never);
       expect(phases.run.mock.invocationCallOrder[0]).toBeLessThan(
         docker.ensureContainer.mock.invocationCallOrder[0]!
+      );
+    });
+
+    /** The redactor the verification job's log lines go through, for a deployment with `envVars`. */
+    async function verificationLogRedactor(envVars: Record<string, string>) {
+      const { docker, dependencies, payload, runner } = releaseFixture({
+        preActivation: null,
+        verification: verify("keep"),
+      });
+      const phases = runner({});
+      await deployAppImageWithDependencies(
+        dependencies,
+        docker as never,
+        runtimeConfig,
+        { ...payload, envVars },
+        phases
+      );
+      const target = phases.run.mock.calls[0]?.[0];
+      expect(target?.envVars).toEqual({ ...envVars, PORT: "8080" });
+      return (line: string) => target?.redactLogLine(line);
+    }
+
+    test("the verification log shows the port the agent gave the candidate (#354)", async () => {
+      const redact = await verificationLogRedactor({ API_TOKEN: "tok-private-value" });
+
+      expect(redact(`against http://${candidateName}:8080 with tok-private-value`)).toBe(
+        `against http://${candidateName}:8080 with [REDACTED]`
+      );
+    });
+
+    test("the verification log still redacts a customer variable equal to the port", async () => {
+      const redact = await verificationLogRedactor({ PIN_CODE: "8080" });
+
+      expect(redact(`against http://${candidateName}:8080`)).toBe(
+        `against http://${candidateName}:[REDACTED]`
       );
     });
 
@@ -3317,6 +3720,165 @@ describe("deployAppImageWithDependencies", () => {
     }
   });
 
+  /**
+   * Deploys over a previous container that Docker inspects as given before and after its stop; `null`
+   * stands for an inspection Docker fails. A volume app's is stopped by the single-writer quiesce,
+   * long before retirement.
+   */
+  async function retirePreviousContainer(input: {
+    stateBeforeStop: Record<string, unknown> | null;
+    exitCodeAfterStop: number | null;
+    removalFailures?: number;
+    volume?: boolean;
+  }) {
+    const docker = createDockerMock();
+    docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    if (input.volume) {
+      docker.listContainersUsingVolume.mockImplementationOnce(async () => [
+        {
+          Id: "ctr_live",
+          Name: "/nouva-app-svc_1-live",
+          State: { Running: input.stateBeforeStop?.Running === true },
+        },
+      ]);
+    }
+    // Docker's stop resolves the same way when it had to SIGKILL the process after the grace period.
+    let liveStopped = false;
+    docker.stopContainer.mockImplementation(async (name: string) => {
+      if (name === "nouva-app-svc_1-live") liveStopped = true;
+    });
+    for (let failure = 0; failure < (input.removalFailures ?? 0); failure += 1) {
+      docker.removeContainer.mockRejectedValueOnce(new Error("removal in progress"));
+    }
+    docker.inspectContainer.mockImplementation(async (name: string) => {
+      if (name === "nouva-app-svc_1-live") {
+        const state = liveStopped
+          ? input.exitCodeAfterStop === null
+            ? null
+            : { Running: false, Status: "exited", ExitCode: input.exitCodeAfterStop }
+          : input.stateBeforeStop;
+        if (state === null) throw new Error("docker daemon unavailable");
+        return { Id: "ctr_live", Name: name, State: state };
+      }
+      return name === "nouva-app-svc_1-dep_1"
+        ? {
+            Id: "ctr_candidate",
+            Name: name,
+            State: { Running: true },
+            NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.10" } } },
+          }
+        : null;
+    });
+    const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      const result = await deployAppImageWithDependencies(
+        {
+          ensureBaseRuntime: async () => undefined,
+          checkTcpConnect: mock(async () => true),
+          fetchImpl: mock(async () =>
+            Response.json([
+              {
+                name: "svc-svc_1@file",
+                loadBalancer: { servers: [{ url: "http://nouva-app-svc_1-dep_1:8080" }] },
+              },
+            ])
+          ) as unknown as typeof fetch,
+          writeLocalTraefikRoute: mock(async () => {}),
+          deleteLocalTraefikRoute: mock(async () => {}),
+          sleep: mock(async () => undefined),
+        },
+        docker as never,
+        runtimeConfig,
+        {
+          ...appRuntimePayload,
+          volume: input.volume ? appRuntimePayload.volume : null,
+          rollout: createRolloutConfig(),
+          runtimeMetadata: { containerName: "nouva-app-svc_1-live", internalPort: 8080 },
+        }
+      );
+      return { docker, rollout: result.rollout };
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  const runningBeforeStop = { Running: true, Status: "running", ExitCode: 0 };
+
+  test.each([
+    ["exited on its stop signal", runningBeforeStop, 0, "graceful"],
+    ["was terminated by its stop signal", runningBeforeStop, 143, "graceful"],
+    ["was SIGKILLed when the grace period ran out", runningBeforeStop, 137, "forced"],
+    ["cannot be inspected once stopped", runningBeforeStop, null, "graceful"],
+    ["cannot be inspected before the stop", null, 137, "graceful"],
+    [
+      "had already exited on an earlier SIGKILL",
+      { Running: false, Status: "exited", ExitCode: 137 },
+      137,
+      "graceful",
+    ],
+    [
+      "was waiting to restart after an out-of-memory kill",
+      { Running: true, Status: "restarting", ExitCode: 137, OOMKilled: true },
+      137,
+      "graceful",
+    ],
+  ])("reports a previous container that %s", async (_description, stateBeforeStop, exitCodeAfterStop, retirement) => {
+    const { docker, rollout } = await retirePreviousContainer({
+      stateBeforeStop,
+      exitCodeAfterStop,
+    });
+
+    expect(rollout).toEqual(
+      expect.objectContaining({ outcome: "committed", previousContainerRetirement: retirement })
+    );
+    // However it went down, the stopped container is retired.
+    expect(docker.removeContainer.mock.calls).toEqual([["nouva-app-svc_1-live", false, 15_000]]);
+  });
+
+  test.each([
+    ["exited on its stop signal", runningBeforeStop, 0, "graceful"],
+    ["was SIGKILLed when the grace period ran out", runningBeforeStop, 137, "forced"],
+    [
+      "had already exited on an earlier SIGKILL",
+      { Running: false, Status: "exited", ExitCode: 137 },
+      137,
+      "graceful",
+    ],
+  ])("reports a volume app's previous container, stopped by the single-writer quiesce, that %s", async (_description, stateBeforeStop, exitCodeAfterStop, retirement) => {
+    const { docker, rollout } = await retirePreviousContainer({
+      stateBeforeStop,
+      exitCodeAfterStop,
+      volume: true,
+    });
+
+    expect(rollout).toEqual(
+      expect.objectContaining({
+        strategy: "single_writer_snapshot_cutover",
+        outcome: "committed",
+        previousContainerRetirement: retirement,
+      })
+    );
+    // The quiesce stopped it before the candidate existed; retirement only finds it stopped.
+    expect(docker.stopContainer.mock.invocationCallOrder[0]).toBeLessThan(
+      docker.ensureContainer.mock.invocationCallOrder[0]!
+    );
+    expect(
+      docker.removeContainer.mock.calls.filter(([name]) => name === "nouva-app-svc_1-live")
+    ).toEqual([["nouva-app-svc_1-live", false, 15_000]]);
+  });
+
+  test("still reports a forced stop when removing the container has to be retried", async () => {
+    const { docker, rollout } = await retirePreviousContainer({
+      stateBeforeStop: runningBeforeStop,
+      exitCodeAfterStop: 137,
+      removalFailures: 1,
+    });
+
+    expect(rollout.previousContainerRetirement).toBe("forced");
+    expect(docker.removeContainer).toHaveBeenCalledTimes(2);
+  });
+
   test("removes the candidate and preserves the live runtime when readiness fails", async () => {
     const docker = createDockerMock();
     docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
@@ -3331,6 +3893,14 @@ describe("deployAppImageWithDependencies", () => {
           },
         };
       }
+      if (name === "nouva-app-svc_1-live") {
+        return {
+          Id: "ctr_live",
+          Name: name,
+          State: { Running: true },
+          NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.9" } } },
+        };
+      }
 
       return null;
     });
@@ -3341,7 +3911,7 @@ describe("deployAppImageWithDependencies", () => {
       deployAppImageWithDependencies(
         {
           ensureBaseRuntime: async () => undefined,
-          checkTcpConnect: mock(async () => false),
+          checkTcpConnect: mock(async () => true),
           fetchImpl: mock(async () => Response.json([])) as typeof fetch,
           writeLocalTraefikRoute,
           deleteLocalTraefikRoute: mock(async () => {}),
@@ -3373,13 +3943,145 @@ describe("deployAppImageWithDependencies", () => {
     expect(docker.removeImage).toHaveBeenCalledWith("127.0.0.1:5000/nouva-app:dep_1", true);
   });
 
+  test("does not report a crash-looping previous container as serving when readiness fails", async () => {
+    const docker = createDockerMock();
+    docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    docker.inspectContainer.mockImplementation(async (name: string) => {
+      if (name === "nouva-app-svc_1-live") {
+        return {
+          Id: "ctr_live",
+          Name: name,
+          RestartCount: 4,
+          State: { Running: false, Status: "restarting", ExitCode: 1, OOMKilled: false },
+        };
+      }
+      return name === "nouva-app-svc_1-dep_1"
+        ? { Id: "ctr_candidate", Name: name, State: { Running: false, Status: "exited" } }
+        : null;
+    });
+    const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      await expect(
+        deployAppImageWithDependencies(
+          {
+            ensureBaseRuntime: async () => undefined,
+            checkTcpConnect: mock(async () => true),
+            fetchImpl: mock(async () => Response.json([])) as unknown as typeof fetch,
+            writeLocalTraefikRoute: mock(async () => {}),
+            deleteLocalTraefikRoute: mock(async () => {}),
+          },
+          docker as never,
+          runtimeConfig,
+          {
+            ...appRuntimePayload,
+            volume: null,
+            rollout: createRolloutConfig(),
+            runtimeMetadata: { containerName: "nouva-app-svc_1-live", internalPort: 8080 },
+          }
+        )
+      ).rejects.toMatchObject({
+        message: "Candidate container nouva-app-svc_1-dep_1 is not running (exited)",
+        result: {
+          rollout: expect.objectContaining({
+            outcome: "aborted_before_cutover",
+            liveRuntimePreserved: false,
+            activeContainerName: "nouva-app-svc_1-live",
+          }),
+        },
+      });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test.each([
+    "candidate readiness",
+    "cutover",
+  ])("still reports the rollout when the image of a release rejected at %s cannot be removed", async (failure) => {
+    const liveName = "nouva-app-svc_1-live";
+    const candidateName = "nouva-app-svc_1-dep_1";
+    const candidateUrl = `http://${candidateName}:8080`;
+    const docker = createDockerMock();
+    docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    docker.removeImage.mockRejectedValue(
+      new Error("conflict: unable to delete image (must be forced) - image is being used")
+    );
+    docker.inspectContainer.mockImplementation(async (name: string) => {
+      if (name === liveName || (name === candidateName && failure === "cutover")) {
+        return {
+          Id: name === liveName ? "ctr_live" : "ctr_candidate",
+          Name: name,
+          State: { Running: true },
+          NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.10" } } },
+        };
+      }
+      return name === candidateName
+        ? { Id: "ctr_candidate", Name: name, State: { Running: false, Status: "exited" } }
+        : null;
+    });
+    // Traefik never confirms the candidate, so a cutover to it fails; the route back is confirmed.
+    let routedUrl = `http://${liveName}:8080`;
+    const writeLocalTraefikRoute = mock(
+      async (_paths: unknown, _serviceId: string, _hostnames: unknown, nextUrl: string) => {
+        routedUrl = nextUrl;
+      }
+    );
+    const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const rejected = await deployAppImageWithDependencies(
+      {
+        ensureBaseRuntime: async () => undefined,
+        checkTcpConnect: mock(async () => true),
+        fetchImpl: mock(async () =>
+          Response.json([
+            {
+              name: "svc-svc_1@file",
+              loadBalancer: {
+                servers: [
+                  { url: routedUrl === candidateUrl ? "http://wrong-target:8080" : routedUrl },
+                ],
+              },
+            },
+          ])
+        ) as unknown as typeof fetch,
+        writeLocalTraefikRoute,
+        deleteLocalTraefikRoute: mock(async () => {}),
+      },
+      docker as never,
+      runtimeConfig,
+      {
+        ...appRuntimePayload,
+        volume: null,
+        rollout: createRolloutConfig(),
+        runtimeMetadata: { containerName: liveName, internalPort: 8080 },
+      }
+    )
+      .then(
+        () => null,
+        (error: unknown) => error
+      )
+      .finally(() => warn.mockRestore());
+
+    expect(rejected).toMatchObject({
+      result: {
+        rollout: expect.objectContaining({
+          outcome: failure === "cutover" ? "rolled_back" : "aborted_before_cutover",
+          liveRuntimePreserved: true,
+          activeContainerName: liveName,
+        }),
+      },
+    });
+    expect(docker.removeImage).toHaveBeenCalledWith(appRuntimePayload.imageUrl, true);
+  });
+
   test("restores the previous route and keeps the live runtime when cutover verification fails", async () => {
     const docker = createDockerMock();
     docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
     docker.inspectContainer.mockImplementation(async (name: string) => {
-      if (name === "nouva-app-svc_1-dep_1") {
+      if (name === "nouva-app-svc_1-dep_1" || name === "nouva-app-svc_1-live") {
         return {
-          Id: "ctr_candidate",
+          Id: name === "nouva-app-svc_1-live" ? "ctr_live" : "ctr_candidate",
           Name: name,
           State: {
             Running: true,
@@ -3476,6 +4178,213 @@ describe("deployAppImageWithDependencies", () => {
     expect(docker.stopContainer).not.toHaveBeenCalled();
   });
 
+  test("keeps the reason a failed cutover could not be rolled back", async () => {
+    const docker = createDockerMock();
+    docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    docker.inspectContainer.mockImplementation(async (name: string) =>
+      name === "nouva-app-svc_1-dep_1"
+        ? {
+            Id: "ctr_candidate",
+            Name: name,
+            State: { Running: true },
+            NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.10" } } },
+          }
+        : null
+    );
+    const rollbackFailure = new Error("traefik config directory is read-only");
+    const writeLocalTraefikRoute = mock(
+      async (_paths: unknown, _serviceId: string, _hostnames: unknown, nextUrl: string) => {
+        if (nextUrl === "http://nouva-app-svc_1-live:8080") throw rollbackFailure;
+      }
+    );
+    const fetchImpl: typeof fetch = mock(async () =>
+      Response.json([
+        {
+          name: "svc-svc_1@file",
+          loadBalancer: { servers: [{ url: "http://wrong-target:8080" }] },
+        },
+      ])
+    ) as typeof fetch;
+    const consoleError = spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const failure = await deployAppImageWithDependencies(
+        {
+          ensureBaseRuntime: async () => undefined,
+          checkTcpConnect: mock(async () => true),
+          fetchImpl,
+          writeLocalTraefikRoute,
+          deleteLocalTraefikRoute: mock(async () => {}),
+        },
+        docker as never,
+        runtimeConfig,
+        {
+          ...appRuntimePayload,
+          volume: null,
+          rollout: createRolloutConfig(),
+          runtimeMetadata: { containerName: "nouva-app-svc_1-live", internalPort: 8080 },
+        }
+      ).then(
+        () => null,
+        (error: unknown) => error
+      );
+
+      expect(failure).toMatchObject({
+        result: {
+          rollout: expect.objectContaining({
+            outcome: "rolled_back",
+            rollbackCompleted: false,
+            liveRuntimePreserved: false,
+          }),
+        },
+      });
+      // The reported error keeps the cutover failure that triggered the rollback.
+      expect((failure as Error).cause).toBeInstanceOf(Error);
+      expect((failure as Error).cause).not.toBe(rollbackFailure);
+      expect(consoleError).toHaveBeenCalledWith(
+        "[nouva-agent] rollback of service svc_1 to its previous release failed",
+        rollbackFailure
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  // Docker keeps a container's restart count and out-of-memory flag across its whole life.
+  const servingLive = (history: { RestartCount: number; OOMKilled: boolean }) => () => ({
+    Id: "ctr_live",
+    Name: "nouva-app-svc_1-live",
+    RestartCount: history.RestartCount,
+    State: { Running: true, Status: "running", ExitCode: 0, OOMKilled: history.OOMKilled },
+    NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.9" } } },
+  });
+
+  test.each([
+    [
+      "is crash-looping",
+      // Still being restarted while the agent watches it.
+      (inspections: number) => ({
+        Id: "ctr_live",
+        Name: "nouva-app-svc_1-live",
+        RestartCount: 4 + inspections,
+        State: { Running: false, Status: "restarting", ExitCode: 1, OOMKilled: false },
+      }),
+      "keeps restarting",
+    ],
+    [
+      "is waiting to be restarted after a memory kill",
+      // Found in Docker's restart backoff, then up again with the flag its last kill left.
+      (inspections: number) =>
+        inspections === 1
+          ? {
+              Id: "ctr_live",
+              Name: "nouva-app-svc_1-live",
+              RestartCount: 3,
+              State: { Running: true, Status: "restarting", ExitCode: 137, OOMKilled: true },
+            }
+          : servingLive({ RestartCount: 4, OOMKilled: true })(),
+      "ran out of memory",
+    ],
+    [
+      "recovered from restarts long before this deploy",
+      servingLive({ RestartCount: 2, OOMKilled: false }),
+      null,
+    ],
+    [
+      "outlived a process killed for memory before this deploy",
+      servingLive({ RestartCount: 0, OOMKilled: true }),
+      null,
+    ],
+    [
+      "was restarted after a memory kill before this deploy",
+      servingLive({ RestartCount: 1, OOMKilled: true }),
+      null,
+    ],
+  ])("after a failed cutover, reports whether a previous container that %s serves", async (_history, inspectLive, refusal) => {
+    const consoleWarn = spyOn(console, "warn").mockImplementation(() => {});
+    const docker = createDockerMock();
+    docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    let liveInspections = 0;
+    docker.inspectContainer.mockImplementation(async (name: string) => {
+      if (name === "nouva-app-svc_1-live") {
+        liveInspections += 1;
+        return inspectLive(liveInspections);
+      }
+      return name === "nouva-app-svc_1-dep_1"
+        ? {
+            Id: "ctr_candidate",
+            Name: name,
+            State: { Running: true },
+            NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.10" } } },
+          }
+        : null;
+    });
+    // Traefik never confirms the candidate, so the cutover fails; the route back is confirmed.
+    let routedUrl = "http://nouva-app-svc_1-live:8080";
+    const writeLocalTraefikRoute = mock(
+      async (_paths: unknown, _serviceId: string, _hostnames: unknown, nextUrl: string) => {
+        routedUrl = nextUrl;
+      }
+    );
+    const fetchImpl = mock(async () =>
+      Response.json([
+        {
+          name: "svc-svc_1@file",
+          loadBalancer: {
+            servers: [
+              {
+                url:
+                  routedUrl === "http://nouva-app-svc_1-dep_1:8080"
+                    ? "http://wrong-target:8080"
+                    : routedUrl,
+              },
+            ],
+          },
+        },
+      ])
+    ) as unknown as typeof fetch;
+
+    const failure = await deployAppImageWithDependencies(
+      {
+        ensureBaseRuntime: async () => undefined,
+        checkTcpConnect: mock(async () => true),
+        fetchImpl,
+        writeLocalTraefikRoute,
+        deleteLocalTraefikRoute: mock(async () => {}),
+      },
+      docker as never,
+      runtimeConfig,
+      {
+        ...appRuntimePayload,
+        volume: null,
+        rollout: createRolloutConfig(),
+        runtimeMetadata: { containerName: "nouva-app-svc_1-live", internalPort: 8080 },
+      }
+    ).then(
+      () => null,
+      (error: unknown) => error
+    );
+
+    const liveRefusals = consoleWarn.mock.calls.filter(
+      ([message]) =>
+        message === "[nouva-agent] previous container nouva-app-svc_1-live cannot take traffic back"
+    );
+    consoleWarn.mockRestore();
+    expect(failure).toMatchObject({
+      result: {
+        rollout: expect.objectContaining({
+          outcome: "rolled_back",
+          rollbackCompleted: true,
+          liveRuntimePreserved: refusal === null,
+        }),
+      },
+    });
+    expect(liveRefusals).toEqual(
+      refusal === null ? [] : [[expect.any(String), expect.stringContaining(refusal)]]
+    );
+    expect(routedUrl).toBe("http://nouva-app-svc_1-live:8080");
+  });
+
   test("stops and snapshots a volume app before launching its candidate", async () => {
     const docker = createDockerMock();
     docker.listContainersUsingVolume
@@ -3543,6 +4452,55 @@ describe("deployAppImageWithDependencies", () => {
         strategy: "single_writer_snapshot_cutover",
         outcome: "committed",
       })
+    );
+    const snapshotTask = (docker.createContainer.mock.calls as unknown as [DockerContainerSpec][])
+      .map(([spec]) => spec)
+      .find((spec) => spec.name.startsWith("nouva-app-snapshot-dep_1"));
+    expect(snapshotTask?.env).toEqual(["SNAPSHOT_NAME=svc_1-dep_1.tar.gz"]);
+    expect(snapshotTask?.cmd?.join("\n")).not.toContain("svc_1-dep_1.tar.gz");
+  });
+
+  test("refuses to snapshot a volume under a name that could inject shell", async () => {
+    const docker = createDockerMock();
+    docker.listContainersUsingVolume.mockImplementation(async () => []);
+
+    await expect(
+      deployAppImageWithDependencies(
+        {
+          ensureBaseRuntime: async () => undefined,
+          checkTcpConnect: mock(async () => true),
+          fetchImpl: mock(async () => Response.json([])) as typeof fetch,
+          writeLocalTraefikRoute: mock(async () => {}),
+          deleteLocalTraefikRoute: mock(async () => {}),
+        },
+        docker as never,
+        runtimeConfig,
+        {
+          ...appRuntimePayload,
+          deploymentId: "dep_1; rm -rf /agent-data #",
+          rollout: createRolloutConfig(),
+          runtimeMetadata: { containerName: "nouva-app-svc_1-live", internalPort: 8080 },
+        }
+      )
+    ).rejects.toMatchObject({
+      message: "App volume snapshot refused an unsafe deploymentId",
+      result: { rollout: expect.objectContaining({ outcome: "aborted_before_cutover" }) },
+    });
+    expect(docker.createContainer).not.toHaveBeenCalled();
+    expect(docker.ensureContainer).not.toHaveBeenCalled();
+  });
+
+  test("builds snapshot names only from plain identifiers", () => {
+    expect(buildAppVolumeSnapshotName({ serviceId: "svc_1", deploymentId: "dep-2" })).toBe(
+      "svc_1-dep-2.tar.gz"
+    );
+    for (const deploymentId of ["$(reboot)", "dep`id`", "../../etc/passwd", "dep 1", "", "-rf"]) {
+      expect(() => buildAppVolumeSnapshotName({ serviceId: "svc_1", deploymentId })).toThrow(
+        "App volume snapshot refused an unsafe deploymentId"
+      );
+    }
+    expect(() => buildAppVolumeSnapshotName({ serviceId: "svc;1", deploymentId: "dep_1" })).toThrow(
+      "App volume snapshot refused an unsafe serviceId"
     );
   });
 
@@ -3614,6 +4572,217 @@ describe("deployAppImageWithDependencies", () => {
     expect(docker.stopContainer).toHaveBeenCalledWith("nouva-app-svc_1-live");
     expect(docker.startContainer).toHaveBeenCalledWith("nouva-app-svc_1-live");
   });
+
+  test("logs why the previous app could not be restarted after a failed volume snapshot", async () => {
+    const docker = createDockerMock();
+    docker.listContainersUsingVolume.mockImplementationOnce(async () => [
+      { Id: "ctr_live", Name: "/nouva-app-svc_1-live", State: { Running: true } },
+    ]);
+    docker.waitContainer.mockImplementationOnce(async () => 1);
+    docker.containerLogs.mockImplementationOnce(async () => "Insufficient snapshot capacity");
+    const restartFailure = new Error("container ctr_live cannot start");
+    docker.startContainer.mockImplementation(async (container: string) => {
+      if (container === "nouva-app-svc_1-live") throw restartFailure;
+    });
+    const consoleError = spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const failure = await deployAppImageWithDependencies(
+        {
+          ensureBaseRuntime: async () => undefined,
+          checkTcpConnect: mock(async () => true),
+          fetchImpl: mock(async () => Response.json([])) as typeof fetch,
+          writeLocalTraefikRoute: mock(async () => {}),
+          deleteLocalTraefikRoute: mock(async () => {}),
+        },
+        docker as never,
+        runtimeConfig,
+        {
+          ...appRuntimePayload,
+          rollout: createRolloutConfig(),
+          runtimeMetadata: { containerName: "nouva-app-svc_1-live", internalPort: 8080 },
+        }
+      ).then(
+        () => null,
+        (error: unknown) => error
+      );
+
+      expect(failure).toMatchObject({
+        message: "Insufficient snapshot capacity",
+        result: {
+          rollout: expect.objectContaining({
+            outcome: "aborted_before_cutover",
+            liveRuntimePreserved: false,
+          }),
+        },
+      });
+      expect((failure as Error).cause).toBeInstanceOf(Error);
+      expect(consoleError).toHaveBeenCalledWith(
+        "[nouva-agent] could not return service svc_1 to its previous container after the volume snapshot failed",
+        restartFailure
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  test.each([
+    "snapshot",
+    "candidate readiness",
+  ])("returns every hostname of a volume app to its previous container when the %s fails", async (failure) => {
+    const liveName = "nouva-app-svc_1-live";
+    const candidateName = "nouva-app-svc_1-dep_1";
+    const docker = createDockerMock();
+    docker.listContainersUsingVolume.mockImplementationOnce(async () => [
+      { Id: "ctr_live", Name: `/${liveName}`, State: { Running: true } },
+    ]);
+    if (failure === "snapshot") {
+      docker.waitContainer.mockImplementationOnce(async () => 1);
+      docker.containerLogs.mockImplementationOnce(async () => "Insufficient snapshot capacity");
+    }
+    let candidateRemoved = false;
+    docker.removeContainer.mockImplementation(async (name: string) => {
+      if (name === candidateName) candidateRemoved = true;
+    });
+    docker.inspectContainer.mockImplementation(async (name: string) => {
+      if (name === liveName) {
+        return {
+          Id: "ctr_live",
+          Name: name,
+          State: { Running: true },
+          NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.9" } } },
+        };
+      }
+      return name === candidateName && !candidateRemoved
+        ? { Id: "ctr_candidate", Name: name, State: { Running: false, Status: "exited" } }
+        : null;
+    });
+    let routedUrl = `http://${liveName}:8080`;
+    const writeLocalTraefikRoute = mock(
+      async (_paths: unknown, _serviceId: string, _hostnames: unknown, nextUrl: string) => {
+        routedUrl = nextUrl;
+      }
+    );
+
+    const failed = await deployAppImageWithDependencies(
+      {
+        ensureBaseRuntime: async () => undefined,
+        checkTcpConnect: mock(async () => true),
+        fetchImpl: mock(async () =>
+          Response.json([
+            { name: "svc-svc_1@file", loadBalancer: { servers: [{ url: routedUrl }] } },
+          ])
+        ) as unknown as typeof fetch,
+        writeLocalTraefikRoute,
+        deleteLocalTraefikRoute: mock(async () => {}),
+      },
+      docker as never,
+      runtimeConfig,
+      {
+        ...appRuntimePayload,
+        providedHostname: "app.edge.example.net",
+        customHostnames: ["shop.example.com", "www.shop.example.com"],
+        rollout: createRolloutConfig(),
+        runtimeMetadata: { containerName: liveName, internalPort: 8080 },
+      }
+    ).then(
+      () => null,
+      (error: unknown) => error
+    );
+
+    expect(failed).toMatchObject({
+      result: { rollout: expect.objectContaining({ liveRuntimePreserved: true }) },
+    });
+    expect(docker.startContainer).toHaveBeenCalledWith(liveName);
+    expect(writeLocalTraefikRoute.mock.calls).toEqual([
+      [
+        expect.anything(),
+        "svc_1",
+        {
+          providedHostname: "app.edge.example.net",
+          customHostnames: ["shop.example.com", "www.shop.example.com"],
+        },
+        `http://${liveName}:8080`,
+      ],
+    ]);
+  });
+
+  test.each([
+    ["candidate readiness", true],
+    ["candidate readiness", false],
+    ["cutover", true],
+    ["cutover", false],
+  ] as const)("a first volume deploy whose %s fails leaves custom domains on the placeholder page (custom domains=%p)", async (failure, withCustomDomains) => {
+    const candidateName = "nouva-app-svc_1-dep_1";
+    const docker = createDockerMock();
+    docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    let candidateRemoved = false;
+    docker.removeContainer.mockImplementation(async (name: string) => {
+      if (name === candidateName) candidateRemoved = true;
+    });
+    docker.inspectContainer.mockImplementation(async (name: string) => {
+      if (name !== candidateName || candidateRemoved) return null;
+      return failure === "cutover"
+        ? {
+            Id: "ctr_candidate",
+            Name: name,
+            State: { Running: true },
+            NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.10" } } },
+          }
+        : { Id: "ctr_candidate", Name: name, State: { Running: false, Status: "exited" } };
+    });
+    const customHostnames = withCustomDomains ? ["shop.example.com", "www.shop.example.com"] : [];
+    const writeLocalTraefikRoute = mock(async () => {});
+    const deleteLocalTraefikRoute = mock(async () => {});
+
+    const failed = await deployAppImageWithDependencies(
+      {
+        ensureBaseRuntime: async () => undefined,
+        checkTcpConnect: mock(async () => true),
+        // Traefik never reports the candidate, so a cutover to it fails.
+        fetchImpl: mock(async () => Response.json([])) as unknown as typeof fetch,
+        writeLocalTraefikRoute,
+        deleteLocalTraefikRoute,
+      },
+      docker as never,
+      { ...runtimeConfig, clientIngressPlaceholderUrl: "https://nouva.sh/_nouva/domain-pending" },
+      {
+        ...appRuntimePayload,
+        customHostnames,
+        rollout: createRolloutConfig(),
+        runtimeMetadata: null,
+      }
+    ).then(
+      () => null,
+      (error: unknown) => error
+    );
+
+    expect(failed).toMatchObject({
+      result: {
+        rollout: expect.objectContaining({
+          outcome: failure === "cutover" ? "rolled_back" : "aborted_before_cutover",
+          liveRuntimePreserved: false,
+        }),
+      },
+    });
+    // A cutover first routes the candidate; the route that counts is the one the rollback leaves.
+    const rollbackRoutes = writeLocalTraefikRoute.mock.calls.slice(failure === "cutover" ? 1 : 0);
+    if (withCustomDomains) {
+      expect(rollbackRoutes).toEqual([
+        [
+          expect.anything(),
+          "svc_1",
+          { providedHostname: null, customHostnames },
+          "https://nouva.sh",
+          { passHostHeader: false, replacePath: "/_nouva/domain-pending" },
+        ],
+      ]);
+      expect(deleteLocalTraefikRoute).not.toHaveBeenCalled();
+    } else {
+      expect(rollbackRoutes).toEqual([]);
+      expect(deleteLocalTraefikRoute).toHaveBeenCalledWith(expect.anything(), "svc_1");
+    }
+  });
 });
 
 describe("buildDatabaseContainerSpec", () => {
@@ -3674,6 +4843,38 @@ describe("buildDatabaseContainerSpec", () => {
         PidsLimit: 512,
       })
     );
+  });
+
+  test("keeps the pgBackRest repository credentials out of the database container env", () => {
+    const spec = buildDatabaseContainerSpec({
+      ...databasePayload,
+      envVars: {
+        ...databasePayload.envVars,
+        PGBACKREST_REPO1_S3_BUCKET: "nouva-backups",
+        PGBACKREST_REPO1_S3_KEY: "pgbackrest-access-key-sentinel",
+        PGBACKREST_REPO1_S3_KEY_SECRET: "pgbackrest-secret-key-sentinel",
+      },
+    });
+
+    const env = spec.spec.env ?? [];
+    expect(env.join("\n")).not.toContain("pgbackrest-access-key-sentinel");
+    expect(env.join("\n")).not.toContain("pgbackrest-secret-key-sentinel");
+    expect(env.some((entry) => entry.startsWith("PGBACKREST_REPO1_S3_KEY"))).toBe(false);
+    expect(env).toEqual(
+      expect.arrayContaining([
+        "PGBACKREST_STANZA=vol-vol_1",
+        "PGBACKREST_REPO1_S3_BUCKET=nouva-backups",
+        "PGBACKREST_CONFIG_INCLUDE_PATH=/etc/nouva/pgbackrest",
+      ])
+    );
+    expect(spec.spec.files).toEqual([
+      expect.objectContaining({
+        path: "/etc/nouva/pgbackrest/repository-credentials.conf",
+        content:
+          "[global]\nrepo1-s3-key=pgbackrest-access-key-sentinel\nrepo1-s3-key-secret=pgbackrest-secret-key-sentinel\n",
+        mode: 0o600,
+      }),
+    ]);
   });
 
   test("stamps environment labels for database containers", () => {
@@ -4093,6 +5294,36 @@ describe("database runtime recreate paths", () => {
         env: expect.arrayContaining(["NOUVA_DATA_PATH=/var/lib/postgresql/pgdata"]),
       })
     );
+  });
+
+  test("hands pgBackRest backup tasks the repository credentials as a file, not env", async () => {
+    const docker = createDockerMock();
+    docker.containerLogs.mockResolvedValueOnce(
+      'NOUVA_PGBACKREST_INFO:[{"backup":[{"label":"20260325-000000F","type":"full","timestamp":{"stop":1774396800},"annotation":{"nouva-backup-id":"backup_1"}}]}]'
+    );
+
+    await handleCreateVolumeBackup(docker as never, runtimeConfig, {
+      ...pgBackrestBackupPayload,
+      envVars: {
+        ...pgBackrestBackupPayload.envVars,
+        PGBACKREST_REPO1_S3_KEY: "pgbackrest-access-key-sentinel",
+        PGBACKREST_REPO1_S3_KEY_SECRET: "pgbackrest-secret-key-sentinel",
+      },
+    });
+
+    // Both the backup and the verify task run pgBackRest against the repository.
+    expect(docker.createContainer).toHaveBeenCalledTimes(2);
+    for (const [spec] of docker.createContainer.mock.calls as unknown as Array<
+      [DockerContainerSpec]
+    >) {
+      expect((spec.env ?? []).join("\n")).not.toContain("pgbackrest-access-key-sentinel");
+      expect((spec.env ?? []).join("\n")).not.toContain("pgbackrest-secret-key-sentinel");
+      expect(spec.env).toContain("PGBACKREST_CONFIG_INCLUDE_PATH=/etc/nouva/pgbackrest");
+      expect(spec.files?.[0]?.content).toContain("repo1-s3-key=pgbackrest-access-key-sentinel");
+      expect(spec.files?.[0]?.content).toContain(
+        "repo1-s3-key-secret=pgbackrest-secret-key-sentinel"
+      );
+    }
   });
 
   test("selects the newest pgBackRest backup when annotations are unavailable", async () => {

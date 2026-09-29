@@ -192,6 +192,92 @@ describe("DockerApiClient.createContainer", () => {
     requestSpy.mockRestore();
   });
 
+  test("writes files into the container before returning it, outside its configuration", async () => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const requestSpy = spyOn(client, "request").mockResolvedValue({ Id: "ctr_files" });
+    const requestRawSpy = spyOn(client, "requestRaw").mockResolvedValue(Buffer.alloc(0));
+    const content = "[global]\nrepo1-s3-key-secret=secret-sentinel\n";
+
+    const id = await client.createContainer({
+      name: "nouva-postgres",
+      image: "registry.nouva.sh/nouva/postgres:17",
+      env: ["POSTGRES_USER=nouva_user"],
+      files: [
+        {
+          path: "/etc/nouva/pgbackrest/repository-credentials.conf",
+          content,
+          mode: 0o600,
+          uid: 999,
+          gid: 999,
+        },
+      ],
+    });
+
+    expect(id).toBe("ctr_files");
+    expect(JSON.stringify(requestSpy.mock.calls)).not.toContain("secret-sentinel");
+    expect(requestRawSpy).toHaveBeenCalledTimes(1);
+    const [method, path, body, , options] = requestRawSpy.mock.calls[0] ?? [];
+    expect(method).toBe("PUT");
+    expect(path).toBe("/containers/ctr_files/archive?path=%2F");
+    expect(options).toEqual({ contentType: "application/x-tar" });
+
+    const archive = body as Buffer;
+    const header = archive.subarray(0, 512);
+    const field = (offset: number, width: number) =>
+      header
+        .subarray(offset, offset + width)
+        .toString("ascii")
+        .replace(/[\0 ]+$/, "");
+    expect(field(0, 100)).toBe("etc/nouva/pgbackrest/repository-credentials.conf");
+    expect(Number.parseInt(field(100, 8), 8)).toBe(0o600);
+    expect(Number.parseInt(field(108, 8), 8)).toBe(999);
+    expect(Number.parseInt(field(116, 8), 8)).toBe(999);
+    expect(Number.parseInt(field(124, 12), 8)).toBe(Buffer.byteLength(content));
+    expect(field(156, 1)).toBe("0");
+    expect(header.subarray(257, 263).toString("ascii")).toBe("ustar\0");
+    const checksumFieldAsSpaces = Buffer.from(header);
+    checksumFieldAsSpaces.fill(" ", 148, 156);
+    expect(Number.parseInt(field(148, 8), 8)).toBe(
+      checksumFieldAsSpaces.reduce((sum, byte) => sum + byte, 0)
+    );
+    expect(archive.subarray(512, 512 + Buffer.byteLength(content)).toString("utf8")).toBe(content);
+    expect(archive.length % 512).toBe(0);
+    expect(archive.subarray(-1024).every((byte) => byte === 0)).toBe(true);
+
+    requestSpy.mockRestore();
+    requestRawSpy.mockRestore();
+  });
+
+  test("removes the created container when its files cannot be written", async () => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const requestSpy = spyOn(client, "request").mockResolvedValue({ Id: "ctr_files" });
+    const uploadError = new DockerApiError(500, "PUT", "/containers/ctr_files/archive", "boom");
+    const requestRawSpy = spyOn(client, "requestRaw").mockRejectedValue(uploadError);
+
+    await expect(
+      client.createContainer({
+        name: "nouva-postgres",
+        image: "registry.nouva.sh/nouva/postgres:17",
+        files: [{ path: "/etc/nouva/file.conf", content: "x", mode: 0o600, uid: 0, gid: 0 }],
+      })
+    ).rejects.toBe(uploadError);
+    expect(requestSpy).toHaveBeenLastCalledWith(
+      "DELETE",
+      "/containers/ctr_files?force=true&v=true",
+      null,
+      undefined
+    );
+
+    requestSpy.mockRestore();
+    requestRawSpy.mockRestore();
+  });
+
   test("does not rewrite logging for an unmanaged helper container", async () => {
     const DockerApiClientCtor = DockerApiClient as unknown as {
       new (apiVersion: string): DockerApiClient;

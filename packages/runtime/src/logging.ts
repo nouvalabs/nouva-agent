@@ -470,6 +470,58 @@ export function collectAgentWorkPayloadOperationalValues(payload: unknown): stri
   return [...values];
 }
 
+/**
+ * The agent rollout result fields that only ever hold one of a few words the agent chooses, for
+ * app and worker rollouts alike (`AppRolloutResult` and `WorkerRolloutResult` in the agent).
+ */
+const AGENT_ROLLOUT_RESULT_VOCABULARY: Readonly<Record<string, ReadonlySet<string>>> = {
+  currentPhase: new Set([
+    "release",
+    "quiesce",
+    "snapshot",
+    "candidate",
+    "ready",
+    "cutover",
+    "verify",
+    "retire",
+    "restore",
+    "rollback",
+  ]),
+  outcome: new Set(["committed", "aborted_before_cutover", "rolled_back"]),
+  previousContainerRetirement: new Set(["graceful", "forced", "deferred"]),
+  strategy: new Set([
+    "candidate_ready_cutover",
+    "single_writer_snapshot_cutover",
+    "stop_first_cutover",
+  ]),
+};
+
+/**
+ * The fields of an agent rollout result whose value is one of that field's own fixed words:
+ * `strategy`, `outcome`, `currentPhase` and `previousContainerRetirement`. Both ends of the agent
+ * protocol keep these as they are instead of redacting them, for #187's reason: the platform's own
+ * material is not a leak. A customer variable that happens to equal `committed` or `graceful` is
+ * not coming back through the rollout's outcome, and treating it as if it were rejected the result
+ * of a rollout that had already replaced the live containers (#345).
+ *
+ * The exemption is scoped to the field rather than added to `operationalValues`, which are exempt
+ * across the whole result: a customer value equal to `ready` must stay redacted in a status message
+ * or a container name. A value outside its field's vocabulary is not returned, so it is still
+ * redacted and still fails the leak check.
+ */
+export function collectAgentRolloutVocabularyFields(
+  rollout: Readonly<Record<string, unknown>>
+): Record<string, string> {
+  const fields: Record<string, string> = {};
+  for (const [key, vocabulary] of Object.entries(AGENT_ROLLOUT_RESULT_VOCABULARY)) {
+    const value = Object.hasOwn(rollout, key) ? rollout[key] : undefined;
+    if (typeof value === "string" && vocabulary.has(value)) {
+      fields[key] = value;
+    }
+  }
+  return fields;
+}
+
 function resolveOperationalValueExclusions(options: LogRedactionOptions): Set<string> {
   const exclusions = new Set<string>();
   for (const value of options.operationalValues ?? []) {

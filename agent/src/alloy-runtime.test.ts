@@ -68,6 +68,18 @@ function createAlloyInput(dataDir: string, redactionContextVersion = "context-v1
   };
 }
 
+const EXPECTED_ALLOY_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024;
+
+interface StoredMemoryLimit {
+  Memory: number;
+  MemorySwap: number;
+}
+
+const CURRENT_MEMORY_LIMIT: StoredMemoryLimit = {
+  Memory: EXPECTED_ALLOY_MEMORY_LIMIT_BYTES,
+  MemorySwap: EXPECTED_ALLOY_MEMORY_LIMIT_BYTES,
+};
+
 function createAlloyInspection(input: {
   image?: string;
   running?: boolean;
@@ -75,6 +87,7 @@ function createAlloyInspection(input: {
   binds?: string[];
   dataVolume?: string;
   logConfigCurrent?: boolean;
+  memoryLimit?: StoredMemoryLimit;
 }): DockerContainerInspection {
   return {
     Id: ALLOY_CONTAINER_NAME,
@@ -83,6 +96,7 @@ function createAlloyInspection(input: {
       Running: input.running ?? true,
     },
     HostConfig: {
+      ...(input.memoryLimit ?? CURRENT_MEMORY_LIMIT),
       Binds: input.binds ?? [
         "/var/run/docker.sock:/var/run/docker.sock",
         "/:/rootfs:ro",
@@ -273,6 +287,25 @@ describe("alloy-runtime", () => {
     expect(config).not.toContain("protobuf_message");
     expect(config).not.toContain("remote_write_version");
     expect(config).not.toContain("X-Redaction-Context-Version");
+  });
+
+  test("collects only the exporter groups behind the service and server metrics (#329)", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+
+    const config = renderAlloyStaticConfig(createAlloyInput(tempDir));
+
+    // cpu, memory, network and diskIO carry container_cpu_usage_seconds_total,
+    // container_memory_working_set_bytes, container_network_*_bytes_total and
+    // container_fs_{reads,writes}_bytes_total; start time and last seen are always exported.
+    expect(config).toContain(
+      'enabled_metrics              = ["cpu", "memory", "network", "diskIO"]'
+    );
+    expect(config).toContain(
+      'set_collectors = ["cpu", "diskstats", "filesystem", "loadavg", "meminfo", "netdev", "stat", "uname"]'
+    );
+    // On hosts using Docker's containerd image store, cAdvisor cannot watch a Docker container
+    // without the containerd socket, so pointing it elsewhere would drop every container metric.
+    expect(config).not.toContain("containerd_host");
   });
 
   test("keeps the runtime-log integration collector on the bounded WAL policy", async () => {
@@ -496,6 +529,117 @@ describe("alloy-runtime", () => {
         },
       })
     );
+  });
+
+  test("bounds the collector's memory with a hard limit and no Go soft limit (#329)", async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+
+    const spec = buildAlloyContainerSpec(createAlloyInput(tempDir), { stateHash: "state-hash" });
+
+    expect(spec.hostConfig).toEqual(expect.objectContaining(CURRENT_MEMORY_LIMIT));
+    // The leak is live memory. A soft limit below the hard one cannot reclaim it and would keep
+    // the collector collecting back to back for days before the hard limit restarted it.
+    expect((spec.env ?? []).filter((entry) => entry.startsWith("GOMEMLIMIT="))).toEqual([]);
+  });
+
+  async function writeCurrentAlloyConfig(input: ReturnType<typeof createAlloyInput>) {
+    const paths = getAlloyRuntimePaths(input.dataDir);
+    const staticConfig = renderAlloyStaticConfig(input);
+    await mkdir(paths.configDir, { recursive: true });
+    await writeFile(paths.staticConfigPath, staticConfig, "utf8");
+    await writeFile(paths.dynamicConfigPath, renderAlloyDynamicConfig(input), "utf8");
+    return { paths, stateHash: createAlloyStateHash(staticConfig) };
+  }
+
+  test.each([
+    ["created before the memory bound", { Memory: 0, MemorySwap: 0 }],
+    [
+      "created with another memory limit",
+      { Memory: 256 * 1024 * 1024, MemorySwap: 256 * 1024 * 1024 },
+    ],
+  ])("recreates a collector %s exactly once", async (_name, memoryLimit) => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+    const input = createAlloyInput(tempDir);
+    const { paths, stateHash } = await writeCurrentAlloyConfig(input);
+    const dockerState: { inspection: DockerContainerInspection | null } = {
+      inspection: createAlloyInspection({ memoryLimit, stateHash }),
+    };
+    const ensuredSpecs: DockerContainerSpec[] = [];
+    const docker = {
+      inspectContainer: mock(async () => dockerState.inspection),
+      inspectImage: mock(async () => ({ Id: "img_1" })),
+      pullImage: mock(async () => undefined),
+      createContainer: mock(async () => "alloy-validation"),
+      startContainer: mock(async () => undefined),
+      waitContainer: mock(async () => 0),
+      containerLogs: mock(async () => ""),
+      removeContainer: mock(async (name: string, _force?: boolean) => {
+        if (name === ALLOY_CONTAINER_NAME) {
+          dockerState.inspection = null;
+        }
+      }),
+      ensureNetwork: mock(async () => undefined),
+      ensureContainer: mock(async (spec: DockerContainerSpec) => {
+        ensuredSpecs.push(spec);
+        dockerState.inspection = createAlloyInspection({
+          stateHash: spec.labels?.[ALLOY_CONFIG_HASH_LABEL] ?? stateHash,
+          memoryLimit: {
+            Memory: Number(spec.hostConfig?.Memory),
+            MemorySwap: Number(spec.hostConfig?.MemorySwap),
+          },
+        });
+        return ALLOY_CONTAINER_NAME;
+      }),
+    };
+    const fetchImpl: typeof fetch = mock(
+      async () => new Response("ok", { status: 200 })
+    ) as typeof fetch;
+    const options = { paths, fetchImpl, timeoutMs: 100, intervalMs: 1 };
+
+    await ensureAlloyRuntime(docker, input, options);
+    await ensureAlloyRuntime(docker, input, options);
+    await ensureAlloyRuntime(docker, input, options);
+
+    const collectorRemovals = docker.removeContainer.mock.calls.filter(
+      ([name]) => name === ALLOY_CONTAINER_NAME
+    );
+    expect(collectorRemovals).toHaveLength(1);
+    expect(ensuredSpecs).toHaveLength(1);
+    expect(ensuredSpecs[0]?.hostConfig).toEqual(expect.objectContaining(CURRENT_MEMORY_LIMIT));
+  });
+
+  test.each([
+    ["with the current memory limit", CURRENT_MEMORY_LIMIT],
+    // Docker keeps the memory limit and stores swap as -1 when the host has no swap accounting.
+    [
+      "on a host without swap accounting",
+      { Memory: EXPECTED_ALLOY_MEMORY_LIMIT_BYTES, MemorySwap: -1 },
+    ],
+    // Docker stores a memory limit the kernel cannot enforce as 0 with swap -1. Treating that as
+    // stale would recreate the collector on every reconcile, and the new one would read the same.
+    ["whose memory limit Docker discarded", { Memory: 0, MemorySwap: -1 }],
+  ])("keeps a collector %s", async (_name, memoryLimit) => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-alloy-"));
+    const input = createAlloyInput(tempDir);
+    const { paths, stateHash } = await writeCurrentAlloyConfig(input);
+    const inspection = createAlloyInspection({ memoryLimit, stateHash });
+    const docker = {
+      inspectContainer: mock(async () => inspection),
+      inspectImage: mock(async () => ({ Id: "img_1" })),
+      pullImage: mock(async () => undefined),
+      createContainer: mock(async () => "alloy-validation"),
+      startContainer: mock(async () => undefined),
+      waitContainer: mock(async () => 0),
+      containerLogs: mock(async () => ""),
+      removeContainer: mock(async () => undefined),
+      ensureNetwork: mock(async () => undefined),
+      ensureContainer: mock(async () => ALLOY_CONTAINER_NAME),
+    };
+
+    await ensureAlloyRuntime(docker, input, { paths, timeoutMs: 100, intervalMs: 1 });
+
+    expect(docker.removeContainer).not.toHaveBeenCalled();
+    expect(docker.ensureContainer).not.toHaveBeenCalled();
   });
 
   test("reconciles Alloy state and reports healthy validation checks", async () => {

@@ -5,7 +5,7 @@ import {
   parseDockerStatsSnapshot,
 } from "./protocol.js";
 
-type HttpMethod = "GET" | "POST" | "DELETE";
+type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
 type DockerRequestBody = Record<string, unknown> | Buffer | string | null;
 
 interface DockerRequestOptions {
@@ -147,10 +147,25 @@ interface DockerSystemDiskUsage {
   }>;
 }
 
+/**
+ * A file written into a container after it is created and before it first starts. It lands in the
+ * container's filesystem only, never in its configuration, so `docker inspect` cannot print it the
+ * way it prints `env`.
+ */
+export interface DockerContainerFile {
+  /** Absolute path inside the container. Missing parent directories are created root-owned 0755. */
+  path: string;
+  content: string;
+  mode: number;
+  uid: number;
+  gid: number;
+}
+
 export interface DockerContainerSpec {
   name: string;
   image: string;
   env?: string[];
+  files?: DockerContainerFile[];
   entrypoint?: string[];
   cmd?: string[];
   tty?: boolean;
@@ -338,6 +353,46 @@ export function parseManagedVolumeDiskUsage(input: unknown): DockerVolumeDiskUsa
       },
     ];
   });
+}
+
+const TAR_BLOCK_BYTES = 512;
+const TAR_NAME_BYTES = 100;
+
+function writeTarOctal(header: Buffer, offset: number, width: number, value: number): void {
+  header.write(`${value.toString(8).padStart(width - 1, "0")}\0`, offset, width, "ascii");
+}
+
+/** Encodes regular files as an uncompressed ustar archive, the format Docker's archive API reads. */
+function buildTarArchive(files: readonly DockerContainerFile[]): Buffer {
+  const mtime = Math.floor(Date.now() / 1000);
+  const blocks: Buffer[] = [];
+  for (const file of files) {
+    const name = file.path.replace(/^\/+/, "");
+    if (Buffer.byteLength(name, "utf8") > TAR_NAME_BYTES) {
+      throw new Error(`Container file path is too long for a tar header: ${file.path}`);
+    }
+
+    const content = Buffer.from(file.content, "utf8");
+    const header = Buffer.alloc(TAR_BLOCK_BYTES);
+    header.write(name, 0, TAR_NAME_BYTES, "utf8");
+    writeTarOctal(header, 100, 8, file.mode);
+    writeTarOctal(header, 108, 8, file.uid);
+    writeTarOctal(header, 116, 8, file.gid);
+    writeTarOctal(header, 124, 12, content.length);
+    writeTarOctal(header, 136, 12, mtime);
+    header.write("0", 156, 1, "ascii");
+    header.write("ustar\u000000", 257, 8, "ascii");
+    // The checksum is summed with its own field read as spaces.
+    header.fill(" ", 148, 156);
+    const checksum = header.reduce((sum, byte) => sum + byte, 0);
+    header.write(`${checksum.toString(8).padStart(6, "0")}\0 `, 148, 8, "ascii");
+
+    const padding = (TAR_BLOCK_BYTES - (content.length % TAR_BLOCK_BYTES)) % TAR_BLOCK_BYTES;
+    blocks.push(header, content, Buffer.alloc(padding));
+  }
+
+  blocks.push(Buffer.alloc(TAR_BLOCK_BYTES * 2));
+  return Buffer.concat(blocks);
 }
 
 export class DockerApiClient {
@@ -838,6 +893,21 @@ export class DockerApiClient {
         NetworkingConfig: spec.networkingConfig,
       }
     );
+    if (spec.files && spec.files.length > 0) {
+      try {
+        await this.requestRaw(
+          "PUT",
+          `/containers/${encodeURIComponent(created.Id)}/archive?path=%2F`,
+          buildTarArchive(spec.files),
+          60_000,
+          { contentType: "application/x-tar" }
+        );
+      } catch (error) {
+        // A container missing its files must not survive for a later start to run without them.
+        await this.removeContainer(created.Id, true);
+        throw error;
+      }
+    }
     return created.Id;
   }
 

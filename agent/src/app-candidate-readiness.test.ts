@@ -272,3 +272,57 @@ describe("assessCandidateReadiness", () => {
     });
   });
 });
+
+describe("assessCandidateReadiness of a container that was already running", () => {
+  function assessRunning(
+    inspection: DockerContainerInspection,
+    outOfMemoryAtStart: boolean,
+    evidence: CandidateRuntimeEvidence = NO_CANDIDATE_RUNTIME_EVIDENCE
+  ) {
+    return assessCandidateReadiness({
+      containerName: CONTAINER_NAME,
+      appPort: 8080,
+      inspection,
+      evidence,
+      restartBaseline: 0,
+      outOfMemoryAtStart,
+    });
+  }
+
+  test("still probes a container that carried the memory-kill flag from before", () => {
+    const assessment = assessRunning(inspect({ state: { OOMKilled: true } }), true);
+
+    expect(assessment.evidence.outOfMemory).toBe(false);
+    expect(assessment.step.kind).toBe("probe");
+  });
+
+  test("still probes a container that outlives a process killed for memory", () => {
+    // Docker 24 and later raise the flag while the container keeps running.
+    const assessment = assessRunning(inspect({ state: { OOMKilled: true } }), false);
+
+    expect(assessment.evidence.outOfMemory).toBe(false);
+    expect(assessment.step.kind).toBe("probe");
+  });
+
+  test.each([
+    ["restarting", inspect({ state: { Status: "restarting", OOMKilled: true, ExitCode: 137 } })],
+    ["restarted", inspect({ RestartCount: 1, state: { OOMKilled: true } })],
+    ["exited", inspect({ state: { Running: false, Status: "exited", OOMKilled: true } })],
+  ])("reports a memory kill it sees the container %s with", (_outcome, inspection) => {
+    const assessment = assessRunning(inspection, false);
+
+    expect(assessment.evidence.outOfMemory).toBe(true);
+    expect(assessment.step).toEqual(
+      expect.objectContaining({ kind: "failed", cause: "out_of_memory" })
+    );
+  });
+
+  test("judges a container down with a flag it carried from before by how it went down", () => {
+    const assessment = assessRunning(
+      inspect({ state: { Running: false, Status: "exited", OOMKilled: true, ExitCode: 1 } }),
+      true
+    );
+
+    expect(assessment.step).toEqual(expect.objectContaining({ kind: "failed", cause: "exited" }));
+  });
+});
