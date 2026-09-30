@@ -344,17 +344,23 @@ export function selectReleaseJobBlocker(
   return null;
 }
 
+/**
+ * How every wait on a job container the agent sees running ends, and no other wait. The control
+ * plane matches stored messages by it to keep those waits up when it cannot see containers (#419).
+ */
+export const RELEASE_JOB_CONTAINER_WAIT_SUFFIX = "whose container is still running on the server";
+
 export function describeReleaseJobWait(blocker: ReleaseJobBlocker): string {
   const deployment = `deployment ${blocker.deploymentId.slice(0, 8)}`;
   switch (blocker.reason) {
     case "outcome_unknown":
       return `Waiting on the pre-activation job of ${deployment}, whose outcome is unknown. Check its effect and mark it succeeded to let this deployment continue`;
     case "container_running":
-      return `Waiting on the pre-activation job of ${deployment}, whose container is still running on the server`;
+      return `Waiting on the pre-activation job of ${deployment}, ${RELEASE_JOB_CONTAINER_WAIT_SUFFIX}`;
     case "running":
       return `Waiting on the pre-activation job of ${deployment}, which is still running`;
     case "own_attempt_running":
-      return "Waiting on an earlier attempt of this deployment's pre-activation job, whose container is still running on the server";
+      return `Waiting on an earlier attempt of this deployment's pre-activation job, ${RELEASE_JOB_CONTAINER_WAIT_SUFFIX}`;
   }
 }
 

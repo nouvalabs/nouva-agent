@@ -16,6 +16,7 @@ import path from "node:path";
 
 import {
   type DockerApiClient,
+  DockerApiError,
   type DockerContainerInspection,
   type DockerContainerSpec,
   MANAGED_CONTAINER_LOG_CONFIG,
@@ -112,7 +113,7 @@ interface ReconcileTraefikRuntimeOptions {
 }
 
 async function connectTraefikToManagedProjectNetworks(
-  docker: Pick<DockerApiClient, "connectNetwork" | "listNetworks">,
+  docker: Pick<DockerApiClient, "connectNetwork" | "inspectNetwork" | "listNetworks">,
   containerName: string,
   serverId: string | undefined
 ): Promise<void> {
@@ -127,7 +128,23 @@ async function connectTraefikToManagedProjectNetworks(
   });
 
   await Promise.all(
-    projectNetworks.map((network) => docker.connectNetwork(network.Name, containerName))
+    projectNetworks.map(async (network) => {
+      try {
+        await docker.connectNetwork(network.Name, containerName);
+      } catch (error) {
+        // A project deleted since the listing took its network with it, which leaves nothing to
+        // connect: `delete_project` does not wait for this reconcile. Docker answers a missing
+        // container with the same 404, so only a network that is gone now is skipped.
+        if (
+          error instanceof DockerApiError &&
+          error.status === 404 &&
+          !(await docker.inspectNetwork(network.Name))
+        ) {
+          return;
+        }
+        throw error;
+      }
+    })
   );
 }
 

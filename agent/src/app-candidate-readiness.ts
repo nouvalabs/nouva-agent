@@ -55,7 +55,7 @@ export interface CandidateReadinessAssessment {
  * restarted while the deployment was still wiring up), so readiness only calls it a loop once the
  * process has failed to stay up twice.
  */
-const RESTART_LOOP_THRESHOLD = 2;
+export const RESTART_LOOP_THRESHOLD = 2;
 
 const TERMINAL_STATUSES = new Set(["exited", "dead", "removing"]);
 

@@ -4371,13 +4371,24 @@ describe("deployAppImageWithDependencies", () => {
   });
 
   // Docker keeps a container's restart count and out-of-memory flag across its whole life.
-  const servingLive = (history: { RestartCount: number; OOMKilled: boolean }) => () => ({
-    Id: "ctr_live",
-    Name: "nouva-app-svc_1-live",
-    RestartCount: history.RestartCount,
-    State: { Running: true, Status: "running", ExitCode: 0, OOMKilled: history.OOMKilled },
-    NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.9" } } },
-  });
+  // `upForMs` is how long before an inspection its current run started.
+  const servingLive =
+    (history: { RestartCount: number; OOMKilled: boolean; upForMs?: number }) => () => ({
+      Id: "ctr_live",
+      Name: "nouva-app-svc_1-live",
+      RestartCount: history.RestartCount,
+      State: {
+        Running: true,
+        Status: "running",
+        ExitCode: 0,
+        OOMKilled: history.OOMKilled,
+        StartedAt:
+          history.upForMs === undefined
+            ? undefined
+            : new Date(Date.now() - history.upForMs).toISOString(),
+      },
+      NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.9" } } },
+    });
   const RECENT_EXIT_WINDOW_MS = 5 * 60_000;
   const DAY_MS = 24 * 60 * 60_000;
 
@@ -4413,7 +4424,7 @@ describe("deployAppImageWithDependencies", () => {
       "keeps crashing after serving briefly",
       // Up and reachable between crashes: Docker restarts a process that ran for over ten seconds
       // after only 100 ms, so the check finds it up almost every time.
-      servingLive({ RestartCount: 6, OOMKilled: false }),
+      servingLive({ RestartCount: 6, OOMKilled: false, upForMs: 15_000 }),
       "Previous container nouva-app-svc_1-live keeps restarting (3 restarts)",
       [15_000, 35_000, 55_000],
     ],
@@ -4437,9 +4448,22 @@ describe("deployAppImageWithDependencies", () => {
     ],
     [
       "crashed twice, the first time just inside the window",
-      servingLive({ RestartCount: 2, OOMKilled: false }),
+      servingLive({ RestartCount: 2, OOMKilled: false, upForMs: 15_000 }),
       "keeps restarting (2 restarts)",
       [15_000, RECENT_EXIT_WINDOW_MS - 10_000],
+    ],
+    [
+      // Two restarts in five minutes, steadily, leave a process up for 150 seconds at most.
+      "crashed twice in a burst, and has served since for as long as a loop of them allows",
+      servingLive({ RestartCount: 2, OOMKilled: false, upForMs: 150_500 }),
+      null,
+      [150_600, 150_800],
+    ],
+    [
+      "crashed twice in a burst, and has served since for less than that",
+      servingLive({ RestartCount: 2, OOMKilled: false, upForMs: 149_500 }),
+      "keeps restarting (2 restarts)",
+      [149_600, 149_800],
     ],
     [
       // The start by hand after each stop clears Docker's restart count.
@@ -6152,6 +6176,29 @@ describe("verified project network cleanup", () => {
 
     expect(docker.disconnectNetwork).toHaveBeenCalledWith(PROJECT_NETWORK, "nouva-traefik", true);
     expect(docker.removeNetwork).toHaveBeenCalledWith(PROJECT_NETWORK);
+  });
+
+  // #449: a Traefik upgrade joins its candidate to every project network while health-checking it,
+  // and an agent that stops mid-upgrade leaves the candidate there, so the delete failed with
+  // "network has active endpoints" until someone removed it by hand.
+  test("detaches the candidate a Traefik upgrade left on the network", async () => {
+    const docker = createDockerMock();
+    docker.inspectNetwork.mockResolvedValueOnce({ Name: PROJECT_NETWORK });
+    docker.inspectContainer.mockImplementation(async (name: string) =>
+      name === "nouva-traefik-candidate"
+        ? { ...traefikInspection([PROJECT_NETWORK]), Name: "/nouva-traefik-candidate" }
+        : traefikInspection(["nouva-local"])
+    );
+
+    const result = await handleDeleteProject(docker as never, { projectId: "proj_1" });
+
+    expect(docker.disconnectNetwork.mock.calls).toEqual([
+      [PROJECT_NETWORK, "nouva-traefik-candidate", true],
+    ]);
+    expect(docker.disconnectNetwork.mock.invocationCallOrder[0]).toBeLessThan(
+      docker.removeNetwork.mock.invocationCallOrder[0]!
+    );
+    expect(result.cleanupProof).toEqual(PROOF);
   });
 
   // The name must come from the same derivation that created the network, not from the payload.

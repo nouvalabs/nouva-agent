@@ -8,6 +8,7 @@ import {
   type WorkerShutdownRole,
 } from "@repo/runtime/worker-shutdown";
 import { hashProjectNetwork } from "./build.js";
+import { countRecentRestarts, hasOutlastedRestartLoop } from "./container-restarts.js";
 import {
   type DockerApiClient,
   type DockerContainerInspection,
@@ -48,6 +49,7 @@ export const DEFAULT_WORKER_CRASH_LOOP_RESTART_COUNT = 3;
 type WorkerRuntimeDocker = Pick<
   DockerApiClient,
   | "containerLogs"
+  | "countContainerExits"
   | "createContainer"
   | "createVolume"
   | "ensureContainer"
@@ -346,15 +348,16 @@ function isTerminalContainerStatus(status: string | undefined): boolean {
 }
 
 export async function waitForWorkerReadiness(
-  docker: Pick<DockerApiClient, "inspectContainer">,
+  docker: Pick<DockerApiClient, "inspectContainer" | "countContainerExits">,
   input: {
     containerName: string;
     hasHealthcheck: boolean;
     /**
      * For a container that kept running up to this check, such as a live replica a scale keeps.
      * Docker counts its restarts over its whole life, and ones it recovered from long ago say
-     * nothing about now, so only the restarts this check observes count. A candidate, or a
-     * container just started by hand (which resets the count), has no earlier ones to leave out.
+     * nothing about now, so only the restarts this check observes count, and those it had moments
+     * before: they are the loop it may still be in. A candidate, or a container just started by
+     * hand (which resets the count), has no earlier ones to leave out.
      */
     ignoreEarlierRestarts?: boolean;
     timeoutMs?: number;
@@ -375,8 +378,12 @@ export async function waitForWorkerReadiness(
   let runningSince: number | null = null;
   let observedRestartCount: number | null = null;
   let restartBaseline: number | null = input.ignoreEarlierRestarts ? null : 0;
+  let recentRestarts = 0;
+  let recoveredFromRecentRestarts = false;
 
   while (now() <= deadline) {
+    // Exits logged before this instant are already in the restart count the inspection reports.
+    const inspectedAt = now();
     const inspection = await docker.inspectContainer(input.containerName);
     if (!inspection) {
       throw new Error(`Worker candidate ${input.containerName} is missing`);
@@ -388,11 +395,27 @@ export async function waitForWorkerReadiness(
     }
 
     const restartCount = inspection.RestartCount ?? 0;
-    restartBaseline ??= restartCount;
-    const restartsObserved = Math.max(0, restartCount - restartBaseline);
-    if (restartsObserved >= crashLoopRestartCount) {
+    if (restartBaseline === null) {
+      restartBaseline = restartCount;
+      recentRestarts = await countRecentRestarts(
+        docker,
+        input.containerName,
+        inspection,
+        inspectedAt
+      );
+      recoveredFromRecentRestarts = hasOutlastedRestartLoop(
+        inspection,
+        inspectedAt,
+        crashLoopRestartCount
+      );
+    }
+    const observedRestarts = Math.max(0, restartCount - restartBaseline);
+    const restarts =
+      (recoveredFromRecentRestarts && observedRestarts === 0 ? 0 : recentRestarts) +
+      observedRestarts;
+    if (restarts >= crashLoopRestartCount) {
       throw new Error(
-        `Worker candidate ${input.containerName} is crash-looping (${restartsObserved} restarts)`
+        `Worker candidate ${input.containerName} is crash-looping (${restarts} restarts)`
       );
     }
     if (observedRestartCount !== null && restartCount > observedRestartCount) {
@@ -405,14 +428,15 @@ export async function waitForWorkerReadiness(
       throw new Error(`Worker candidate ${input.containerName} became unhealthy`);
     }
 
+    // Docker reports a container waiting out its restart back-off as running, and with the health
+    // status its last run ended on. The back-off of one that has crash-looped for a while grows to
+    // a minute, longer than the grace period, so only a started process counts.
+    const started = inspection.State?.Running === true && status !== "restarting";
     if (input.hasHealthcheck) {
-      if (healthStatus === "healthy") {
+      if (healthStatus === "healthy" && started) {
         return;
       }
-    } else if (inspection.State?.Running && status !== "restarting") {
-      // Docker reports a container waiting out its restart back-off as running. The back-off of
-      // one that has crash-looped for a while grows to a minute, longer than the grace period, so
-      // only a started process counts.
+    } else if (started) {
       runningSince ??= now();
       if (now() - runningSince >= runningGraceMs) {
         return;
@@ -737,9 +761,9 @@ async function keepWorkerVolumeSnapshot(
  * running is started again. Two kinds are left alone: one that survived SIGKILL is not a process to
  * build on, and one found already stopped that the control plane does not record as live was never
  * part of the live runtime — starting either could put a second writer on a single-writer volume.
- * A container the rollout never got to is counted if it is running and otherwise not touched. The
- * volume's running consumers are checked before each start, allowing only previous containers
- * already running.
+ * A container the rollout never got to is counted if it passes the readiness check a replica that
+ * kept running must, and otherwise not touched. The volume's running consumers are checked before
+ * each start, allowing only previous containers already running.
  *
  * Never throws, because it runs while reporting another failure.
  */
@@ -755,6 +779,9 @@ async function restorePreviousWorkerRuntime(
 ): Promise<{ liveRuntimePreserved: boolean; rollbackCompleted: boolean }> {
   const outcomes = new Map(input.shutdowns.map((report) => [report.containerName, report.outcome]));
   const runningNames = new Set<string>();
+  // Docker reports a crash-looping container as running too, so these are judged before counting.
+  const foundRunning: DockerContainerInspection[] = [];
+  let restarted = false;
   let rollbackCompleted = true;
   try {
     const toStart: DockerContainerInspection[] = [];
@@ -777,6 +804,7 @@ async function restorePreviousWorkerRuntime(
           await docker.updateContainerRestartPolicy(identifier, "unless-stopped");
         }
         runningNames.add(getContainerName(container));
+        foundRunning.push(current);
       } else if (outcome !== undefined) {
         toStart.push(container);
       }
@@ -795,12 +823,14 @@ async function restorePreviousWorkerRuntime(
         wait: input.clock.wait,
       });
       runningNames.add(getContainerName(container));
+      restarted = true;
     }
   } catch (error) {
     console.warn("Failed to restore the previous worker runtime", error);
     rollbackCompleted = false;
   }
-  const liveRuntimePreserved = runningNames.size > 0;
+  const liveRuntimePreserved =
+    restarted || (await anyReplicaRuns(docker, foundRunning, input.clock));
   return { liveRuntimePreserved, rollbackCompleted: rollbackCompleted && liveRuntimePreserved };
 }
 
@@ -812,24 +842,43 @@ function describeKeptSnapshot(path: string, dataVolume: string): string {
   );
 }
 
-/** Whether any of `containers` is running now. A failed inspection counts as not running. */
-async function anyContainerRunning(
-  docker: Pick<DockerApiClient, "inspectContainer">,
-  containers: readonly DockerContainerInspection[]
+/**
+ * Whether any of `replicas`, containers that kept running up to this check, runs: passes the
+ * readiness check a candidate must. Running is not enough, since a replica may be crash-looping,
+ * often why a new version is being deployed, and Docker reports one waiting out its restart
+ * back-off as running. Restarts from long before the check do not count against a replica.
+ *
+ * Never throws, because it runs while reporting another failure.
+ */
+async function anyReplicaRuns(
+  docker: Pick<DockerApiClient, "inspectContainer" | "countContainerExits">,
+  replicas: readonly DockerContainerInspection[],
+  clock: WorkerShutdownClock
 ): Promise<boolean> {
-  for (const container of containers) {
-    try {
-      const current = await docker.inspectContainer(getContainerIdentifier(container));
-      if (current?.State?.Running) {
+  // Side by side, so replicas that are not running cost one readiness timeout, not one each.
+  const running = await Promise.all(
+    replicas.map(async (replica) => {
+      try {
+        await waitForWorkerReadiness(docker, {
+          containerName: getContainerName(replica),
+          hasHealthcheck: Boolean(replica.State?.Health),
+          ignoreEarlierRestarts: true,
+          now: clock.now,
+          wait: clock.wait,
+        });
         return true;
+      } catch (error) {
+        // Not running is the answer, not a failure. Claiming a live runtime that cannot be
+        // confirmed would mark the service running, so an unreadable replica does not count either.
+        console.warn(
+          `Worker replica ${getContainerName(replica)} is not running`,
+          error instanceof Error ? error.message : error
+        );
+        return false;
       }
-    } catch (error) {
-      // Runs while reporting another failure; claiming a live runtime that cannot be confirmed
-      // would mark the service running, so an unreadable container is not counted.
-      console.warn(`Failed to inspect worker ${getContainerName(container)}`, error);
-    }
-  }
-  return false;
+    })
+  );
+  return running.includes(true);
 }
 
 /**
@@ -868,13 +917,16 @@ function recordedLiveRuntime(
  * Whether the worker still runs as the control plane last recorded it, for a deploy that halted
  * before touching it: at least one recorded live replica has to pass the readiness check a candidate
  * must. Untouched is not the same as running, since the replicas may be crash-looping, often why a
- * new version is being deployed. They have kept running, so restarts they recovered from before the
- * check do not count against them.
+ * new version is being deployed. They have kept running, so restarts they recovered from long
+ * before the check do not count against them.
  *
  * Never throws, because it runs while reporting another failure.
  */
 export async function previousWorkerRuntimeRuns(
-  docker: Pick<DockerApiClient, "inspectContainer" | "listContainersByLabels">,
+  docker: Pick<
+    DockerApiClient,
+    "inspectContainer" | "countContainerExits" | "listContainersByLabels"
+  >,
   input: {
     serviceId: string;
     runtimeMetadata: RuntimeMetadata | null | undefined;
@@ -892,29 +944,7 @@ export async function previousWorkerRuntimeRuns(
     console.warn(`Failed to list the replicas of worker ${input.serviceId}`, error);
     return false;
   }
-  // Side by side, so replicas that are not running cost one readiness timeout, not one each.
-  const running = await Promise.all(
-    replicas.map(async (replica) => {
-      try {
-        await waitForWorkerReadiness(docker, {
-          containerName: getContainerName(replica),
-          hasHealthcheck: Boolean(replica.State?.Health),
-          ignoreEarlierRestarts: true,
-          now: clock.now,
-          wait: clock.wait,
-        });
-        return true;
-      } catch (error) {
-        // Not running is the answer, not a failure.
-        console.warn(
-          `Worker replica ${getContainerName(replica)} is not running`,
-          error instanceof Error ? error.message : error
-        );
-        return false;
-      }
-    })
-  );
-  return running.includes(true);
+  return anyReplicaRuns(docker, replicas, clock);
 }
 
 async function assertContainersAbsent(
@@ -1315,7 +1345,8 @@ export async function deployWorkerRuntime(
     // Only a container running now preserves the service: a recorded-live one that was already
     // stopped when this rollout began is in `retiredContainers` but runs nothing.
     let liveRuntimePreserved =
-      plan.order === "candidate_first" && (await anyContainerRunning(docker, untouchedContainers));
+      plan.order === "candidate_first" &&
+      (await anyReplicaRuns(docker, untouchedContainers, clock));
     let rollbackCompleted = false;
     let keptSnapshot: string | null = null;
     if (plan.order === "stop_first") {

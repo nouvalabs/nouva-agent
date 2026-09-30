@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import type { DockerContainerInspection } from "./docker-api.js";
+import { DockerApiError, type DockerContainerInspection } from "./docker-api.js";
 import type { AgentRuntimeConfig } from "./protocol.js";
 import {
   buildTraefikContainerSpec,
@@ -409,6 +409,76 @@ describe("traefik-runtime", () => {
       ["nouva-project-one", TRAEFIK_CONTAINER_NAME],
       ["nouva-project-two", TRAEFIK_CONTAINER_NAME],
     ]);
+  });
+
+  describe("when a connect finds nothing to connect", () => {
+    const projectNetwork = (name: string, projectId: string) => ({
+      Id: name,
+      Name: name,
+      Labels: { "nouva.managed": "true", "nouva.project.id": projectId },
+    });
+
+    async function reconcileCurrent(input: {
+      notFound: string;
+      networkStillExists: boolean;
+    }): Promise<{ failure: unknown; connected: string[] }> {
+      tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
+      const paths = getTraefikRuntimePaths(tempDir);
+      await ensureTraefikState(paths);
+      const stateHash = createTraefikStateHash(renderTraefikStaticConfig(paths));
+      const connected: string[] = [];
+      const docker = {
+        ensureNetwork: mock(async () => {}),
+        inspectContainer: mock(async () => createTraefikInspection({ stateHash })),
+        listNetworks: mock(async () => [
+          projectNetwork("nouva-project-one", "project-1"),
+          projectNetwork("nouva-project-two", "project-2"),
+        ]),
+        connectNetwork: mock(async (network: string) => {
+          if (network === "nouva-project-one") {
+            throw new DockerApiError(
+              404,
+              "POST",
+              `/v1.52/networks/${network}/connect`,
+              input.notFound
+            );
+          }
+          connected.push(network);
+        }),
+        inspectNetwork: mock(async (network: string) =>
+          network === "nouva-project-one" && !input.networkStillExists ? null : { Name: network }
+        ),
+      };
+      const failure = await reconcileTraefikRuntime(docker as never, runtimeConfig, {
+        dataVolume: "nouva-agent-data",
+        paths,
+      }).then(
+        () => null,
+        (error: unknown) => error
+      );
+      return { failure, connected };
+    }
+
+    // #449: `delete_project` does not wait for the reconcile, so a network the listing returned
+    // can be gone by the time Traefik is connected to it.
+    test("skips a project network deleted since the listing", async () => {
+      const { failure, connected } = await reconcileCurrent({
+        notFound: '{"message":"network nouva-project-one not found"}',
+        networkStillExists: false,
+      });
+
+      expect(failure).toBeNull();
+      expect(connected).toEqual(["nouva-project-two"]);
+    });
+
+    test("still fails when the Traefik container is the one missing", async () => {
+      const { failure } = await reconcileCurrent({
+        notFound: '{"message":"No such container: nouva-traefik"}',
+        networkStillExists: true,
+      });
+
+      expect((failure as Error).message).toContain("No such container: nouva-traefik");
+    });
   });
 
   test("should report the fixed Traefik validation keys", async () => {

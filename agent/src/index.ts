@@ -48,6 +48,7 @@ import {
 import {
   assessCandidateReadiness,
   NO_CANDIDATE_RUNTIME_EVIDENCE,
+  RESTART_LOOP_THRESHOLD,
 } from "./app-candidate-readiness.js";
 import { buildApp, hashProjectNetwork } from "./build.js";
 import {
@@ -57,6 +58,11 @@ import {
 } from "./build-logs.js";
 import { detectHostClockSync, evaluateClockSync } from "./clock-sync.js";
 import { collectManagedContainerLogConfigValidationCheck } from "./container-log-reconciliation.js";
+import {
+  countRecentRestarts,
+  hasOutlastedRestartLoop,
+  readRestartCount,
+} from "./container-restarts.js";
 import {
   buildDatabaseReadinessProbe,
   collectDatabaseRuntimeHealthReport,
@@ -162,6 +168,7 @@ import {
   DEFAULT_TRAEFIK_IMAGE,
   deleteLocalTraefikRoute,
   ensureTraefikRuntime,
+  TRAEFIK_CANDIDATE_CONTAINER_NAME,
   type TraefikRuntimeInput,
   writeLocalTraefikRoute,
 } from "./traefik-runtime.js";
@@ -787,50 +794,6 @@ const defaultDeployAppImageDependencies: DeployAppImageDependencies = {
   sleep,
 };
 
-/**
- * How far back a readiness check of a container that kept running counts restarts it did not see.
- * A release that serves for a while and then crashes is up for most of its loop: Docker restarts a
- * process that ran for over ten seconds after only 100 ms, and any other after at most a minute.
- * Finding it up and reachable then says nothing, and its recent restarts are the only evidence of
- * the loop. Restarts older than five minutes are history the container recovered from. The
- * lookback is best effort: Docker's event log holds only its latest few hundred events across all
- * containers, and each health check logs three, so on a host running a few workers it may reach
- * back only two or three minutes. A short log can only miss restarts, never report a loop that
- * did not happen.
- */
-const RECENT_EXIT_WINDOW_MS = 5 * 60_000;
-
-/**
- * The restarts Docker's restart policy performed in the window before `until`. Its restart count
- * covers the container's whole life, so the recent ones are the exits its event log records in the
- * window. A stop by hand also logs an exit, but the start by hand that follows clears the restart
- * count, which therefore caps them.
- */
-async function countRecentRestarts(
-  docker: Pick<DockerApiClient, "countContainerExits">,
-  containerName: string,
-  inspection: DockerContainerInspection,
-  until: number
-): Promise<number> {
-  const restarts = readRestartCount(inspection);
-  if (restarts === 0) return 0;
-  try {
-    const exits = await docker.countContainerExits(
-      inspection.Id,
-      until - RECENT_EXIT_WINDOW_MS,
-      until
-    );
-    return Math.min(restarts, exits);
-  } catch (error) {
-    // No evidence against the container: it is judged, as before, by the restarts the check sees.
-    console.warn(
-      `[nouva-agent] could not read recent exits of container ${containerName}`,
-      error instanceof Error ? error.message : error
-    );
-    return 0;
-  }
-}
-
 async function waitForAppCandidateReadiness(
   dependencies: Pick<DeployAppImageDependencies, "checkTcpConnect">,
   docker: Pick<DockerApiClient, "inspectContainer" | "countContainerExits">,
@@ -870,7 +833,11 @@ async function waitForAppCandidateReadiness(
       const up = state?.Running === true && state.Status?.toLowerCase() === "running";
       history ??= {
         restarts: readRestartCount(inspection),
-        recentRestarts: await countRecentRestarts(docker, containerName, inspection, inspectedAt),
+        // A container that recovered answers its first probe, which ends this check, so unlike a
+        // worker's check it has no later restart to count the burst again by.
+        recentRestarts: hasOutlastedRestartLoop(inspection, inspectedAt, RESTART_LOOP_THRESHOLD)
+          ? 0
+          : await countRecentRestarts(docker, containerName, inspection, inspectedAt),
         outOfMemory: up && state?.OOMKilled === true,
       };
     }
@@ -4862,13 +4829,15 @@ export async function handleDeleteVolume(docker: DockerApiClient, payload: Delet
  * Remove the per-project Docker network left behind when the last service in a project is deleted.
  *
  * The control plane only queues this once the project holds no services, volumes or buckets, so the
- * only endpoint that can still be attached is Traefik, which joins a project network on the first app
- * or database deploy. Docker refuses to delete a network with endpoints attached, so Traefik is
- * disconnected first. Both steps are gated on what Docker reports: a project that never deployed
- * anything has no network, one that only ran workers has a network Traefik never joined, and Docker
- * 29 answers a disconnect in either case with a 500 rather than a 404. Attachment is read from the
- * Traefik container rather than the network, because the network only lists running containers and
- * a stopped Traefik still attached to a removed network can no longer start.
+ * only endpoints that can still be attached are Traefik's: Traefik joins a project network on the
+ * first app or database deploy, and the candidate a Traefik upgrade health-checks joins every project
+ * network, where an agent that stops mid-upgrade leaves it. Docker refuses to delete a network with
+ * endpoints attached, so they are disconnected first. The disconnects and the removal are gated on
+ * what Docker reports: a project that never deployed anything has no network, one that only ran
+ * workers has a network Traefik never joined, and Docker 29 answers a disconnect in either case with
+ * a 500 rather than a 404. Attachment is read from the Traefik containers rather than the network,
+ * because the network only lists running containers and a stopped Traefik still attached to a
+ * removed network can no longer start.
  *
  * The name is derived here rather than taken from the payload so it is produced by the same
  * function that created the network (`buildProjectNetwork`), which is the only definition of it.
@@ -4877,9 +4846,11 @@ export async function handleDeleteProject(docker: DockerApiClient, payload: Dele
   const networkName = buildProjectNetwork(payload.projectId);
 
   if (await docker.inspectNetwork(networkName)) {
-    const traefik = await docker.inspectContainer(TRAEFIK_CONTAINER_NAME);
-    if (traefik?.NetworkSettings?.Networks?.[networkName]) {
-      await docker.disconnectNetwork(networkName, TRAEFIK_CONTAINER_NAME, true);
+    for (const containerName of [TRAEFIK_CONTAINER_NAME, TRAEFIK_CANDIDATE_CONTAINER_NAME]) {
+      const traefik = await docker.inspectContainer(containerName);
+      if (traefik?.NetworkSettings?.Networks?.[networkName]) {
+        await docker.disconnectNetwork(networkName, containerName, true);
+      }
     }
     await docker.removeNetwork(networkName);
     await verifyNetworkAbsent(docker, networkName);
@@ -6223,11 +6194,6 @@ async function handleRestart(docker: DockerApiClient, payload: RestartServicePay
       containerName: payload.containerName ?? payload.runtimeMetadata?.containerName ?? null,
     },
   };
-}
-
-function readRestartCount(inspection: DockerContainerInspection | null): number {
-  const restarts = inspection?.RestartCount;
-  return typeof restarts === "number" && Number.isFinite(restarts) && restarts > 0 ? restarts : 0;
 }
 
 /**
