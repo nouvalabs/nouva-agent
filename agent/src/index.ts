@@ -14,6 +14,8 @@ import {
 } from "@repo/runtime/external-backup-import";
 import {
   collectAgentRolloutVocabularyFields,
+  collectAgentRuntimeInstanceVocabularyFields,
+  collectAgentWorkAssignedNames,
   collectAgentWorkPayloadOperationalValues,
   maskAgentResultDescriptiveFields,
 } from "@repo/runtime/logging";
@@ -58,11 +60,7 @@ import {
 } from "./build-logs.js";
 import { detectHostClockSync, evaluateClockSync } from "./clock-sync.js";
 import { collectManagedContainerLogConfigValidationCheck } from "./container-log-reconciliation.js";
-import {
-  countRecentRestarts,
-  hasOutlastedRestartLoop,
-  readRestartCount,
-} from "./container-restarts.js";
+import { countRestartLoop, readRestartCount } from "./container-restarts.js";
 import {
   buildDatabaseReadinessProbe,
   collectDatabaseRuntimeHealthReport,
@@ -809,8 +807,18 @@ async function waitForAppCandidateReadiness(
    */
   {
     alreadyRunning = false,
+    restartsBeforeStart = 0,
     subject = "Candidate container",
-  }: { alreadyRunning?: boolean; subject?: string } = {}
+  }: {
+    alreadyRunning?: boolean;
+    /**
+     * With `alreadyRunning`, for a container this rollout stopped and then started again by hand:
+     * the restarts of the loop it was in before the stop. The start cleared its restart count, so
+     * they are the only trace of that loop, and count as recent restarts.
+     */
+    restartsBeforeStart?: number;
+    subject?: string;
+  } = {}
 ): Promise<void> {
   const deadline = Date.now() + rollout.readiness.timeoutMs;
   let evidence = NO_CANDIDATE_RUNTIME_EVIDENCE;
@@ -835,9 +843,15 @@ async function waitForAppCandidateReadiness(
         restarts: readRestartCount(inspection),
         // A container that recovered answers its first probe, which ends this check, so unlike a
         // worker's check it has no later restart to count the burst again by.
-        recentRestarts: hasOutlastedRestartLoop(inspection, inspectedAt, RESTART_LOOP_THRESHOLD)
-          ? 0
-          : await countRecentRestarts(docker, containerName, inspection, inspectedAt),
+        recentRestarts:
+          restartsBeforeStart +
+          (await countRestartLoop(
+            docker,
+            containerName,
+            inspection,
+            inspectedAt,
+            RESTART_LOOP_THRESHOLD
+          )),
         outOfMemory: up && state?.OOMKilled === true,
       };
     }
@@ -940,9 +954,11 @@ const SIGKILL_EXIT_CODE = 137;
 
 type AppContainerState = DockerContainerInspection["State"] | null;
 
-/** A stop this rollout made, with the container's state from just before it. */
+/** A stop this rollout made, with the container's state and restart loop from just before it. */
 interface AppContainerStop {
   stateBeforeStop: AppContainerState;
+  /** The restarts of the loop it was in, which starting it again by hand erases from Docker. */
+  restartsBeforeStop: number;
 }
 
 /**
@@ -961,17 +977,18 @@ function describeAppContainerStop(
   return stopEndedIt && afterStop?.ExitCode === SIGKILL_EXIT_CODE ? "forced" : "graceful";
 }
 
-async function readRetiringAppContainerState(
+async function inspectRetiringAppContainer(
   docker: Pick<DockerApiClient, "inspectContainer">,
   containerName: string,
   serviceId: string,
   deploymentId: string,
   stage: "before_quiesce_stop" | "before_stop" | "after_stop"
-): Promise<AppContainerState> {
+): Promise<DockerContainerInspection | null> {
   try {
-    return (await docker.inspectContainer(containerName))?.State ?? null;
+    return await docker.inspectContainer(containerName);
   } catch (error) {
-    // Retirement does not depend on it; the stop is only reported as graceful for lack of evidence.
+    // Retirement does not depend on it; the stop is only reported as graceful for lack of evidence,
+    // and a container restored after it is judged without the restarts it had before.
     console.warn("[nouva-agent] app rollout retirement stop outcome unknown", {
       containerName,
       deploymentId,
@@ -981,6 +998,52 @@ async function readRetiringAppContainerState(
     });
     return null;
   }
+}
+
+async function readRetiringAppContainerState(
+  docker: Pick<DockerApiClient, "inspectContainer">,
+  containerName: string,
+  serviceId: string,
+  deploymentId: string,
+  stage: "before_stop" | "after_stop"
+): Promise<AppContainerState> {
+  return (
+    (await inspectRetiringAppContainer(docker, containerName, serviceId, deploymentId, stage))
+      ?.State ?? null
+  );
+}
+
+/**
+ * Reads the previous container before the single-writer quiesce stops it. A failed rollout starts
+ * it again by hand, which clears Docker's restart count: afterwards, only the restarts read here
+ * show whether it was crash-looping.
+ */
+async function readAppContainerBeforeQuiesceStop(
+  docker: Pick<DockerApiClient, "inspectContainer" | "countContainerExits">,
+  containerName: string,
+  serviceId: string,
+  deploymentId: string
+): Promise<AppContainerStop> {
+  const inspectedAt = Date.now();
+  const inspection = await inspectRetiringAppContainer(
+    docker,
+    containerName,
+    serviceId,
+    deploymentId,
+    "before_quiesce_stop"
+  );
+  return {
+    stateBeforeStop: inspection?.State ?? null,
+    restartsBeforeStop: inspection
+      ? await countRestartLoop(
+          docker,
+          containerName,
+          inspection,
+          inspectedAt,
+          RESTART_LOOP_THRESHOLD
+        )
+      : 0,
+  };
 }
 
 async function retirePreviousAppContainerAttempt(
@@ -1876,19 +1939,38 @@ function agentProtocolValueHasRedactionConflict(
   }
 }
 
+function keepRuntimeInstanceKind(instance: unknown, sanitized: unknown): unknown {
+  return typeof sanitized === "object" && sanitized !== null && !Array.isArray(sanitized)
+    ? { ...sanitized, ...collectAgentRuntimeInstanceVocabularyFields(toObject(instance)) }
+    : sanitized;
+}
+
 /**
  * Sanitizes one protocol field. A rollout's strategy, outcome and phase, and its worker shutdown
  * fields, keep their closed vocabularies rather than being redacted, the same way the control plane
  * reads them, so a customer variable equal to "committed", "SIGTERM" or "previous" cannot turn a
- * finished rollout into a leak.
+ * finished rollout into a leak. A runtime instance keeps its kind the same way, so "app" or
+ * "worker" cannot either.
  */
 function sanitizeAgentProtocolValue(
   key: (typeof AGENT_WORK_RESULT_PROTOCOL_KEYS)[number],
   value: unknown,
   environmentVariables: EnvironmentVariableMap,
-  operationalValues: readonly string[]
+  operationalValues: readonly string[],
+  assignedNames: readonly string[]
 ): unknown {
-  const sanitized = sanitizeSensitiveProtocolValue(value, environmentVariables, operationalValues);
+  const sanitized = sanitizeSensitiveProtocolValue(
+    value,
+    environmentVariables,
+    operationalValues,
+    assignedNames
+  );
+  if (key === "runtimeInstance") {
+    return keepRuntimeInstanceKind(value, sanitized);
+  }
+  if (key === "runtimeInstances" && Array.isArray(value) && Array.isArray(sanitized)) {
+    return sanitized.map((instance, index) => keepRuntimeInstanceKind(value[index], instance));
+  }
   if (
     key !== "rollout" ||
     typeof value !== "object" ||
@@ -1903,21 +1985,36 @@ function sanitizeAgentProtocolValue(
     ...sanitized,
     ...collectAgentRolloutVocabularyFields(value as Record<string, unknown>),
     ...sanitizeWorkerRolloutShutdownFields(value as Record<string, unknown>, (containerName) =>
-      sanitizeSensitiveProtocolValue(containerName, environmentVariables, operationalValues)
+      sanitizeSensitiveProtocolValue(
+        containerName,
+        environmentVariables,
+        operationalValues,
+        assignedNames
+      )
     ),
   };
 }
 
+/**
+ * `operationalValues` and `assignedNames` come from the leased payload, through
+ * `collectAgentWorkPayloadOperationalValues` and `collectAgentWorkAssignedNames`.
+ */
 export function sanitizeAgentWorkResult(
   result: Record<string, unknown> | null | undefined,
   environmentVariables: EnvironmentVariableMap,
-  operationalValues: readonly string[] = []
+  operationalValues: readonly string[] = [],
+  assignedNames: readonly string[] = []
 ): Record<string, unknown> | null {
   if (!result) {
     return null;
   }
 
-  const sanitizedResult = sanitizeSensitiveValue(result, environmentVariables, operationalValues);
+  const sanitizedResult = sanitizeSensitiveValue(
+    result,
+    environmentVariables,
+    operationalValues,
+    assignedNames
+  );
   if (!sanitizedResult || typeof sanitizedResult !== "object" || Array.isArray(sanitizedResult)) {
     return null;
   }
@@ -1929,7 +2026,8 @@ export function sanitizeAgentWorkResult(
         key,
         result[key],
         environmentVariables,
-        operationalValues
+        operationalValues,
+        assignedNames
       );
       if (agentProtocolValueHasRedactionConflict(key, result[key], sanitizedProtocolValue)) {
         throw new AgentWorkResultRedactionConflictError();
@@ -1944,6 +2042,7 @@ export function sanitizeAgentWorkResult(
 }
 
 export function buildAgentWorkFailureReport(input: {
+  assignedNames?: readonly string[];
   environmentVariables: EnvironmentVariableMap;
   errorMessage: string;
   operationalValues?: readonly string[];
@@ -1952,7 +2051,12 @@ export function buildAgentWorkFailureReport(input: {
   const operationalValues = input.operationalValues ?? [];
   let result: Record<string, unknown> | null;
   try {
-    result = sanitizeAgentWorkResult(input.result, input.environmentVariables, operationalValues);
+    result = sanitizeAgentWorkResult(
+      input.result,
+      input.environmentVariables,
+      operationalValues,
+      input.assignedNames
+    );
   } catch (error) {
     if (!(error instanceof AgentWorkResultRedactionConflictError)) {
       throw error;
@@ -3373,11 +3477,17 @@ async function previousAppRuntimeCanServe(
   docker: Pick<DockerApiClient, "inspectContainer" | "countContainerExits">,
   containerName: string,
   appPort: number,
-  rollout: AppRolloutConfig
+  rollout: AppRolloutConfig,
+  /**
+   * A stop this rollout made and undid by starting the container again by hand. The start cleared
+   * its restart count, so the restarts it had before the stop count instead.
+   */
+  undoneStop?: AppContainerStop
 ): Promise<boolean> {
   try {
     await waitForAppCandidateReadiness(dependencies, docker, containerName, appPort, rollout, {
       alreadyRunning: true,
+      restartsBeforeStart: undoneStop?.restartsBeforeStop,
       subject: "Previous container",
     });
     return true;
@@ -3733,15 +3843,12 @@ export async function deployAppImageWithDependencies(
     try {
       await assertSingleRunningVolumeConsumer(docker, payload.volume.volumeName, previousContainer);
       if (previousContainer) {
-        previousQuiesceStop = {
-          stateBeforeStop: await readRetiringAppContainerState(
-            docker,
-            previousContainer,
-            payload.serviceId,
-            payload.deploymentId,
-            "before_quiesce_stop"
-          ),
-        };
+        previousQuiesceStop = await readAppContainerBeforeQuiesceStop(
+          docker,
+          previousContainer,
+          payload.serviceId,
+          payload.deploymentId
+        );
         await docker.stopContainer(previousContainer);
       }
       await assertSingleRunningVolumeConsumer(docker, payload.volume.volumeName, null);
@@ -3772,7 +3879,16 @@ export async function deployAppImageWithDependencies(
             previousServiceUrl!,
             rollout
           );
-          liveRuntimePreserved = true;
+          // Traffic is back on the only release that can run, but a release that was
+          // crash-looping before the quiesce passes a readiness check from a fresh start.
+          liveRuntimePreserved = await previousAppRuntimeCanServe(
+            dependencies,
+            docker,
+            previousContainer,
+            resolveAppRuntimePort(payload.runtimeMetadata, appPort),
+            rollout,
+            previousQuiesceStop
+          );
         } catch (restartError) {
           // The snapshot failure below is what gets reported; liveRuntimePreserved=false tells the
           // control plane the previous release is not serving, and this log says why.
@@ -3861,19 +3977,20 @@ export async function deployAppImageWithDependencies(
       }
     }
     if (dockerLocalImages) await removeRejectedAppImage(docker, payload);
-    // A volume app's previous container was just started again and passed readiness in the
-    // restore above. Any other was left running as it was, which says nothing about whether it
-    // serves: it may be crash-looping, and the service must not read as running.
+    // Any other app's previous container was left running as it was, and a volume app's was just
+    // started again by the restore above, which passes a release that crashes after a while.
+    // Neither says whether it serves: it may be crash-looping, and the service must not read as
+    // running.
     const liveRuntimePreserved =
       previousContainer !== null &&
-      (Boolean(payload.volume) ||
-        (await previousAppRuntimeCanServe(
-          dependencies,
-          docker,
-          previousContainer,
-          resolveAppRuntimePort(payload.runtimeMetadata, appPort),
-          rollout
-        )));
+      (await previousAppRuntimeCanServe(
+        dependencies,
+        docker,
+        previousContainer,
+        resolveAppRuntimePort(payload.runtimeMetadata, appPort),
+        rollout,
+        previousQuiesceStop
+      ));
     throw new AppRolloutError(
       error instanceof Error ? error.message : "Candidate container failed readiness checks",
       buildAppRolloutResult({
@@ -4074,16 +4191,18 @@ export async function deployAppImageWithDependencies(
       rollbackCompleted = false;
       liveRuntimePreserved = false;
     }
-    // A volume app's previous container was just started again and passed readiness above. Any
-    // other was left running as it was, which says nothing about whether it serves: it may be
-    // crash-looping, often why this release was deployed, and the service must not read as running.
-    if (liveRuntimePreserved && previousContainer && !payload.volume) {
+    // Any other app's previous container was left running as it was, and a volume app's was just
+    // started again above, which passes a release that crashes after a while. Neither says whether
+    // it serves: it may be crash-looping, often why this release was deployed, and the service
+    // must not read as running.
+    if (liveRuntimePreserved && previousContainer) {
       liveRuntimePreserved = await previousAppRuntimeCanServe(
         dependencies,
         docker,
         previousContainer,
         resolveAppRuntimePort(payload.runtimeMetadata, appPort),
-        rollout
+        rollout,
+        previousQuiesceStop
       );
     }
     if (dockerLocalImages) await removeRejectedAppImage(docker, payload);
@@ -6599,6 +6718,7 @@ async function processWorkItem(
 
   const payload = toObject(workItem.payload);
   const operationalValues = collectAgentWorkPayloadOperationalValues(payload);
+  const assignedNames = collectAgentWorkAssignedNames(payload);
   const redactError = (error: unknown) =>
     redactSensitiveText(
       error instanceof Error ? error.message : "Unknown agent reporting failure",
@@ -6922,6 +7042,7 @@ async function processWorkItem(
 
       if (workError) {
         const report = buildAgentWorkFailureReport({
+          assignedNames,
           environmentVariables: toRecord(payload.envVars),
           errorMessage: workError.message,
           operationalValues,
@@ -6932,7 +7053,12 @@ async function processWorkItem(
       try {
         return {
           kind: "complete",
-          result: sanitizeAgentWorkResult(result, toRecord(payload.envVars), operationalValues),
+          result: sanitizeAgentWorkResult(
+            result,
+            toRecord(payload.envVars),
+            operationalValues,
+            assignedNames
+          ),
         };
       } catch (error) {
         if (!(error instanceof AgentWorkResultRedactionConflictError)) throw error;

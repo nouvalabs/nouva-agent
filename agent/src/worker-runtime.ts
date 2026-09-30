@@ -8,7 +8,11 @@ import {
   type WorkerShutdownRole,
 } from "@repo/runtime/worker-shutdown";
 import { hashProjectNetwork } from "./build.js";
-import { countRecentRestarts, hasOutlastedRestartLoop } from "./container-restarts.js";
+import {
+  countRecentRestarts,
+  countRestartLoop,
+  hasOutlastedRestartLoop,
+} from "./container-restarts.js";
 import {
   type DockerApiClient,
   type DockerContainerInspection,
@@ -360,6 +364,12 @@ export async function waitForWorkerReadiness(
      * hand (which resets the count), has no earlier ones to leave out.
      */
     ignoreEarlierRestarts?: boolean;
+    /**
+     * For a container this rollout stopped and has just started again by hand: the restarts of the
+     * loop it was in before the stop. The start cleared its restart count, so they are the only
+     * trace of that loop, and count toward it.
+     */
+    restartsBeforeStart?: number;
     timeoutMs?: number;
     intervalMs?: number;
     runningGraceMs?: number;
@@ -378,7 +388,7 @@ export async function waitForWorkerReadiness(
   let runningSince: number | null = null;
   let observedRestartCount: number | null = null;
   let restartBaseline: number | null = input.ignoreEarlierRestarts ? null : 0;
-  let recentRestarts = 0;
+  let recentRestarts = input.restartsBeforeStart ?? 0;
   let recoveredFromRecentRestarts = false;
 
   while (now() <= deadline) {
@@ -763,7 +773,9 @@ async function keepWorkerVolumeSnapshot(
  * part of the live runtime — starting either could put a second writer on a single-writer volume.
  * A container the rollout never got to is counted if it passes the readiness check a replica that
  * kept running must, and otherwise not touched. The volume's running consumers are checked before
- * each start, allowing only previous containers already running.
+ * each start, allowing only previous containers already running. A container started again is
+ * judged with the restarts it had before its stop, which the start erased, and one that does not
+ * run does not stop the others from being started.
  *
  * Never throws, because it runs while reporting another failure.
  */
@@ -774,6 +786,8 @@ async function restorePreviousWorkerRuntime(
     shutdowns: readonly WorkerShutdownReport[];
     isRecordedLive: (container: DockerContainerInspection) => boolean;
     volumeName: string | null;
+    /** By container name, from `readRestartLoopsBeforeStop`. */
+    restartsBeforeStop: ReadonlyMap<string, number>;
     clock: WorkerShutdownClock;
   }
 ): Promise<{ liveRuntimePreserved: boolean; rollbackCompleted: boolean }> {
@@ -811,19 +825,31 @@ async function restorePreviousWorkerRuntime(
     }
     for (const container of toStart) {
       const identifier = getContainerIdentifier(container);
+      const name = getContainerName(container);
       if (input.volumeName) {
         await assertNoUnexpectedVolumeConsumer(docker, input.volumeName, runningNames);
       }
       await docker.updateContainerRestartPolicy(identifier, "unless-stopped");
       await docker.startContainer(identifier);
-      await waitForWorkerReadiness(docker, {
-        containerName: getContainerName(container),
-        hasHealthcheck: false,
-        now: input.clock.now,
-        wait: input.clock.wait,
-      });
-      runningNames.add(getContainerName(container));
-      restarted = true;
+      runningNames.add(name);
+      try {
+        await waitForWorkerReadiness(docker, {
+          containerName: name,
+          hasHealthcheck: false,
+          restartsBeforeStart: input.restartsBeforeStop.get(name),
+          now: input.clock.now,
+          wait: input.clock.wait,
+        });
+        restarted = true;
+      } catch (error) {
+        // It is back as it was before this rollout, only not running, which is the answer rather
+        // than a failed restore. The replicas after it are still started: any that runs keeps the
+        // service up.
+        console.warn(
+          `Previous worker ${name} is not running after its restore`,
+          error instanceof Error ? error.message : error
+        );
+      }
     }
   } catch (error) {
     console.warn("Failed to restore the previous worker runtime", error);
@@ -832,6 +858,37 @@ async function restorePreviousWorkerRuntime(
   const liveRuntimePreserved =
     restarted || (await anyReplicaRuns(docker, foundRunning, input.clock));
   return { liveRuntimePreserved, rollbackCompleted: rollbackCompleted && liveRuntimePreserved };
+}
+
+/**
+ * The restart loop each container is in, by name, read just before a stop-first rollout stops them:
+ * a restore starts them again by hand, which clears their restart counts, and with them every trace
+ * of a crash loop.
+ */
+async function readRestartLoopsBeforeStop(
+  docker: Pick<DockerApiClient, "inspectContainer" | "countContainerExits">,
+  containers: readonly DockerContainerInspection[],
+  clock: WorkerShutdownClock
+): Promise<Map<string, number>> {
+  const loops = new Map<string, number>();
+  for (const container of containers) {
+    const name = getContainerName(container);
+    const inspectedAt = clock.now();
+    const current = await docker.inspectContainer(getContainerIdentifier(container));
+    if (current) {
+      loops.set(
+        name,
+        await countRestartLoop(
+          docker,
+          name,
+          current,
+          inspectedAt,
+          DEFAULT_WORKER_CRASH_LOOP_RESTART_COUNT
+        )
+      );
+    }
+  }
+  return loops;
 }
 
 function describeKeptSnapshot(path: string, dataVolume: string): string {
@@ -1244,6 +1301,7 @@ export async function deployWorkerRuntime(
   );
 
   let snapshotName: string | null = null;
+  let restartsBeforeStop: ReadonlyMap<string, number> = new Map();
   if (plan.order === "stop_first") {
     try {
       // A retry can find candidates a prior attempt started before it was interrupted. Nothing
@@ -1268,6 +1326,7 @@ export async function deployWorkerRuntime(
           new Set(previousContainers.map(getContainerName))
         );
       }
+      restartsBeforeStop = await readRestartLoopsBeforeStop(docker, previousContainers, clock);
       const previousReports = await stopAllGracefully(previousContainers, retiredRole);
       const unstoppedPrevious = previousReports.find(mayStillRun);
       if (unstoppedPrevious) {
@@ -1289,6 +1348,7 @@ export async function deployWorkerRuntime(
           shutdowns,
           isRecordedLive,
           volumeName: payload.volume?.volumeName ?? null,
+          restartsBeforeStop,
           clock,
         }
       );
@@ -1369,6 +1429,7 @@ export async function deployWorkerRuntime(
               shutdowns,
               isRecordedLive,
               volumeName: payload.volume?.volumeName ?? null,
+              restartsBeforeStop,
               clock,
             }
           ));

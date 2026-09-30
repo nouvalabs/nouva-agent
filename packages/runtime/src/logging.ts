@@ -47,6 +47,15 @@ export interface SafeLogger {
 }
 
 export interface LogRedactionOptions {
+  /**
+   * Names the platform derived from a work item's ids, from `collectAgentWorkAssignedNames`. A
+   * structured string that is exactly one of them is kept whole rather than searched for customer
+   * values: `FLASK_APP=app` is not leaking through the container name `nouva-app-…`, and redacting
+   * `app` inside it refused the result of a healthy deployment (#451). No customer chose any part
+   * of one, so none can hold a secret. Anything else, including text that merely contains one, is
+   * redacted as usual.
+   */
+  assignedNames?: readonly string[];
   environmentVariables?: Readonly<Record<string, string | undefined>>;
   exactStructuredValues?: readonly string[];
   /**
@@ -488,6 +497,102 @@ export function collectAgentWorkPayloadOperationalValues(payload: unknown): stri
   return [...values];
 }
 
+/** `services.replica_count` is bounded at 32. */
+export const MAX_WORKER_REPLICA_COUNT = 32;
+
+function readPayloadIdentifier(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function readReplicaCount(record: Record<string, unknown>): number {
+  const value = record.replicaCount;
+  return typeof value === "number" && Number.isInteger(value)
+    ? Math.min(Math.max(value, 0), MAX_WORKER_REPLICA_COUNT)
+    : 0;
+}
+
+/**
+ * The tag the agent gives an image it builds for a deployment, in its default docker-local image
+ * store. Deployment ids are cuid2s, or UUIDs for a redeploy or a rollback. Anything else, such as
+ * an image the customer deploys, a registry address or a suffixed tag, does not match.
+ */
+const BUILT_IMAGE_REFERENCE =
+  /^nouva-app:(?:[a-z][a-z0-9]{23}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+
+/**
+ * A retained image's reference when it is an image the agent built. An instant rollback records
+ * the image it reverted to under the rollback's own deployment id, so after one the live image is
+ * named for an older deployment than the one its `deploymentId` gives.
+ */
+function readBuiltImageReference(image: Record<string, unknown>): string | null {
+  const reference = image.reference;
+  return typeof reference === "string" && BUILT_IMAGE_REFERENCE.test(reference) ? reference : null;
+}
+
+/**
+ * The names the agent gives what a work item starts, which it derives from the ids in the payload
+ * rather than being told them: an app's container and the image a source build tags, a worker's
+ * replicas and a scheduled job's container. The agent and the API pass them as `assignedNames`
+ * when redacting a result, and the legacy diagnostic audit leaves them out for the same reason.
+ *
+ * The deployment the work replaces is named too, from the ids in the live runtime metadata the
+ * payload carries, because a result reports the image it keeps for rollback and the replicas it
+ * retires. Replicas are named up to the larger of the two replica counts, for a scale-down. A
+ * retained image the agent built is named by its reference as well, parsed strictly, since after
+ * an instant rollback it belongs to an older deployment than the metadata's ids.
+ *
+ * Only ids go into them. A name the customer chose, such as a hostname, a service name or the
+ * image they deploy, is deliberately not here, so a secret typed into one is still searched for.
+ *
+ * They are spelled out here rather than imported from `./agent.js`, whose `build*ContainerName`
+ * helpers they match, because the public agent mirror cannot ship that module. A name that drifts
+ * from the agent's is only no longer recognized, so its field is checked as any other would be.
+ * An image pushed to the agent's optional local registry carries that registry's address, which
+ * only the agent knows, and is not recognized either.
+ */
+export function collectAgentWorkAssignedNames(payload: unknown): string[] {
+  const record = asRecord(payload);
+  const serviceId = readPayloadIdentifier(record, "serviceId");
+  if (!serviceId) {
+    return [];
+  }
+  const service = serviceId.slice(0, 8);
+  const runtimeMetadata = asRecord(record.runtimeMetadata);
+  const replicaCount = Math.max(readReplicaCount(record), readReplicaCount(runtimeMetadata));
+  const retainedImages = [
+    asRecord(runtimeMetadata.currentImage),
+    asRecord(runtimeMetadata.previousImage),
+  ];
+  const deploymentIds = [
+    readPayloadIdentifier(record, "deploymentId"),
+    ...retainedImages.map((image) => readPayloadIdentifier(image, "deploymentId")),
+  ];
+  const names = new Set<string>();
+  for (const image of retainedImages) {
+    const reference = readBuiltImageReference(image);
+    if (reference) {
+      names.add(reference);
+    }
+  }
+  for (const deploymentId of deploymentIds) {
+    if (!deploymentId) {
+      continue;
+    }
+    const deployment = deploymentId.slice(0, 8);
+    names.add(`nouva-app-${service}-${deployment}`);
+    names.add(`nouva-app:${deploymentId}`);
+    for (let index = 0; index < replicaCount; index += 1) {
+      names.add(`nouva-worker-${service}-${deployment}-${index}`);
+    }
+  }
+  const scheduleRunId = readPayloadIdentifier(record, "scheduleRunId");
+  if (scheduleRunId) {
+    names.add(`nouva-worker-job-${service}-${scheduleRunId.slice(0, 8)}`);
+  }
+  return [...names];
+}
+
 /**
  * The agent rollout result fields that only ever hold one of a few words the agent chooses, for
  * app and worker rollouts alike (`AppRolloutResult` and `WorkerRolloutResult` in the agent).
@@ -538,6 +643,27 @@ export function collectAgentRolloutVocabularyFields(
     }
   }
   return fields;
+}
+
+/** The kinds of runtime an agent result's `runtimeInstance` or `runtimeInstances` report. */
+const AGENT_RUNTIME_INSTANCE_KINDS: ReadonlySet<string> = new Set([
+  "app",
+  "database",
+  "worker",
+  "worker_job",
+]);
+
+/**
+ * The `kind` of a runtime instance an agent result reports, when it is one of the platform's own
+ * kinds, kept for the rollout vocabulary's reason: `FLASK_APP=app` and `ROLE=worker` are not
+ * leaking through the instance's kind, and treating them as if they were refused every deployment
+ * of such a service (#451). Any other value is not returned, so it is still redacted.
+ */
+export function collectAgentRuntimeInstanceVocabularyFields(
+  instance: Readonly<Record<string, unknown>>
+): Record<string, string> {
+  const kind = Object.hasOwn(instance, "kind") ? instance.kind : undefined;
+  return typeof kind === "string" && AGENT_RUNTIME_INSTANCE_KINDS.has(kind) ? { kind } : {};
 }
 
 /** Top-level agent result fields that only describe what a build detected. */
@@ -654,6 +780,7 @@ type LiteralSecretMatcherNode = {
 type LiteralSecretMatcher = readonly LiteralSecretMatcherNode[];
 
 type CompiledLogRedaction = {
+  assignedNames: ReadonlySet<string>;
   boundaryTextValues: readonly string[];
   exactStructuredValues: ReadonlySet<string>;
   preserveObjectKeys: boolean;
@@ -725,6 +852,7 @@ function compileLogRedaction(options: LogRedactionOptions): CompiledLogRedaction
     resolvePlatformGeneratedValues(options)
   );
   return {
+    assignedNames: new Set(options.assignedNames ?? []),
     boundaryTextValues: boundary,
     exactStructuredValues: new Set(resolveExactStructuredValues(options)),
     preserveObjectKeys: options.preserveObjectKeys === true,
@@ -813,9 +941,13 @@ function redactTextWithSecretMatcher(
   matcher: LiteralSecretMatcher,
   boundaryTextValues: readonly string[] = []
 ): string {
-  const redacted = redactLiteralSecretsWithMatcher(value, matcher, boundaryTextValues);
+  return redactCredentialShapes(
+    redactLiteralSecretsWithMatcher(value, matcher, boundaryTextValues)
+  );
+}
 
-  return redacted
+function redactCredentialShapes(value: string): string {
+  return value
     .replace(SENSITIVE_HEADER_PATTERN, `$1=${REDACTED_LOG_VALUE}`)
     .replace(URI_USERINFO_PATTERN, `$1${REDACTED_LOG_VALUE}@`)
     .replace(SENSITIVE_QUERY_VALUE_PATTERN, `$1${REDACTED_LOG_VALUE}`)
@@ -854,6 +986,12 @@ function sanitizeValue(
   seen: WeakSet<object>
 ): unknown {
   if (typeof value === "string") {
+    if (redaction.assignedNames.has(value)) {
+      // Only the customer-value search is skipped. A credential's shape is still masked, so both
+      // ends of the agent protocol, one of which compares against a copy redacted with no values
+      // at all, keep producing the same string.
+      return redactCredentialShapes(value);
+    }
     if (redaction.exactStructuredValues.has(value)) {
       return REDACTED_LOG_VALUE;
     }

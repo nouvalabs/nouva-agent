@@ -912,9 +912,13 @@ export async function reconcileTraefikRuntime(
     }),
     true
   );
-  await connectTraefikToManagedProjectNetworks(docker, TRAEFIK_CANDIDATE_CONTAINER_NAME, serverId);
 
   try {
+    await connectTraefikToManagedProjectNetworks(
+      docker,
+      TRAEFIK_CANDIDATE_CONTAINER_NAME,
+      serverId
+    );
     await waitForTraefikHealth(docker, paths, {
       containerName: TRAEFIK_CANDIDATE_CONTAINER_NAME,
       adminPort: TRAEFIK_CANDIDATE_ADMIN_PORT,
@@ -942,9 +946,11 @@ export async function reconcileTraefikRuntime(
     }),
     true
   );
-  await connectTraefikToManagedProjectNetworks(docker, TRAEFIK_CONTAINER_NAME, serverId);
 
   try {
+    // A Traefik that misses a project network cannot route that project's services, so a failed
+    // connect is a failed cutover: the rollback below restores the previous image.
+    await connectTraefikToManagedProjectNetworks(docker, TRAEFIK_CONTAINER_NAME, serverId);
     await waitForTraefikHealth(docker, paths, {
       containerName: TRAEFIK_CONTAINER_NAME,
       adminPort: TRAEFIK_ADMIN_PORT,

@@ -3,14 +3,21 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { collectAgentWorkPayloadOperationalValues } from "@repo/runtime/logging";
+import {
+  collectAgentWorkAssignedNames,
+  collectAgentWorkPayloadOperationalValues,
+} from "@repo/runtime/logging";
 import type { ReleasePhase } from "@repo/runtime/release-phases";
 import agentPackageJson from "../package.json" with { type: "json" };
 import { executeAndReportAgentWork } from "./agent-work-reporting.js";
 import type { DeployAppImageInput } from "./app-build-runtime.js";
 import { buildAndDeployAppWithDependencies } from "./app-build-runtime.js";
 import { hashProjectNetwork } from "./build.js";
-import { DockerApiError, type DockerContainerSpec } from "./docker-api.js";
+import {
+  DockerApiError,
+  type DockerContainerInspection,
+  type DockerContainerSpec,
+} from "./docker-api.js";
 import {
   ApiRequestError,
   adoptReregisteredCredentials,
@@ -956,6 +963,254 @@ describe("agent work mutation errors", () => {
         customerVariables
       )
     ).toThrow("Agent work result conflicts with protected environment material");
+  });
+
+  describe("a customer value that is a word of the names a deployment was given (#451)", () => {
+    const serviceId = "5a1f0c3e-9b7d-4e21-8c44-0f3a9d6b2e17";
+    const deploymentId = "c7e2b9a4-1d3f-4a6b-9e8c-5f0d2a7b3c91";
+    const previousDeploymentId = "e41d8b07-3c5a-4f92-b6e1-7d0c9a2f5b38";
+    const containerName = `nouva-app-${serviceId.slice(0, 8)}-${deploymentId.slice(0, 8)}`;
+    const containerId = "9d4be2c07a1f3e58b6d2c9a04f7e1b3d8c5a6e2f0b9d7c4a1e3f5b8d2c6a9e0f";
+    const secret = "sentinel-private-value";
+    const liveRuntimeMetadata = {
+      containerName: `nouva-app-${serviceId.slice(0, 8)}-${previousDeploymentId.slice(0, 8)}`,
+      image: `nouva-app:${previousDeploymentId}`,
+      imageStoreMode: "docker-local" as const,
+      currentImage: {
+        reference: `nouva-app:${previousDeploymentId}`,
+        imageId: "sha256:4c1e7a9d0b3f6e2c8a5d1b7f9e0c3a6d2b8f4e1c7a0d9b3e6f2c5a8d1b4e7f0c",
+        deploymentId: previousDeploymentId,
+        commitHash: "0f3a9d6b2e17c7e2b9a41d3f4a6b9e8c5f0d2a7b",
+      },
+      internalPort: 8080,
+    };
+
+    /** A deployment to roll out, and the runtime metadata of the one it replaces. */
+    interface FlaskSiteRelease {
+      deploymentId: string;
+      runtimeMetadata: DeployAppImageInput["runtimeMetadata"];
+    }
+    const nextRelease: FlaskSiteRelease = { deploymentId, runtimeMetadata: liveRuntimeMetadata };
+
+    /** Deploys `imageUrl` for the `my-flask-site` subdomain and returns what the agent reports. */
+    async function deployFlaskSite(
+      envVars: Record<string, string>,
+      imageUrl: string,
+      release: FlaskSiteRelease = nextRelease
+    ) {
+      const releaseContainerName = `nouva-app-${serviceId.slice(0, 8)}-${release.deploymentId.slice(0, 8)}`;
+      const docker = createDockerMock();
+      docker.ensureContainer.mockImplementation(async () => containerId);
+      docker.inspectImage.mockImplementation(async () => ({
+        Id: "sha256:b7f2d9e4a1c6083f5e2b9d7a4c1f6e3b8d0a5c2f9e7b4d1a6c3f0e8b5d2a9c7e",
+      }));
+      docker.inspectContainer.mockImplementation(async (name: string) =>
+        name === releaseContainerName
+          ? {
+              Id: containerId,
+              Name: name,
+              State: { Running: true },
+              NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.10" } } },
+            }
+          : null
+      );
+      return await deployAppImageWithDependencies(
+        {
+          ensureBaseRuntime: async () => undefined,
+          checkTcpConnect: mock(async () => true),
+          fetchImpl: mock(async () =>
+            Response.json([
+              {
+                name: `svc-${serviceId}@file`,
+                loadBalancer: { servers: [{ url: `http://${releaseContainerName}:8080` }] },
+              },
+            ])
+          ) as unknown as typeof fetch,
+          writeLocalTraefikRoute: mock(async () => {}),
+          deleteLocalTraefikRoute: mock(async () => {}),
+          sleep: mock(async () => undefined),
+        },
+        docker as never,
+        runtimeConfig,
+        {
+          ...appRuntimePayload,
+          serviceId,
+          deploymentId: release.deploymentId,
+          serviceName: "backend",
+          subdomain: "my-flask-site",
+          envVars,
+          imageUrl,
+          commitHash: "5f0d2a7b3c91c7e2b9a41d3f4a6b9e8c0f3a9d6b",
+          volume: null,
+          rollout: createRolloutConfig(),
+          runtimeMetadata: release.runtimeMetadata,
+        }
+      );
+    }
+
+    /** The material the agent reads from the payload it leased, as `processWorkItem` does. */
+    function readLeasedPayload(
+      payload: Record<string, unknown>,
+      release: FlaskSiteRelease = nextRelease
+    ) {
+      const leased = {
+        ...payload,
+        serviceId,
+        deploymentId: release.deploymentId,
+        serviceName: "backend",
+        subdomain: "my-flask-site",
+        volume: null,
+        runtimeMetadata: release.runtimeMetadata,
+        providedHostname: "my-flask-site.up.nouva.cloud",
+      };
+      return {
+        operationalValues: collectAgentWorkPayloadOperationalValues(leased),
+        assignedNames: collectAgentWorkAssignedNames(leased),
+      };
+    }
+
+    test("reports a source build whose container name holds a customer value", async () => {
+      // Regression for #451: `FLASK_APP=app` was redacted inside the container name `nouva-app-…`
+      // and the image `nouva-app:…` the agent derived, so it refused the result of a deployment
+      // that was already serving.
+      const envVars = { FLASK_APP: "app", SECRET_KEY: secret };
+      const result = await deployFlaskSite(envVars, `nouva-app:${deploymentId}`);
+      // The build-and-deploy payload names no container or image, only the ids they come from.
+      const { operationalValues, assignedNames } = readLeasedPayload({ ...appPayload, envVars });
+
+      expect(result).toMatchObject({
+        externalHost: "my-flask-site.up.nouva.cloud",
+        runtimeInstance: { kind: "app", containerName },
+        // The image of the deployment this one replaced, kept for rollback.
+        runtimeMetadata: { previousImage: { reference: `nouva-app:${previousDeploymentId}` } },
+      });
+      expect(sanitizeAgentWorkResult(result, envVars, operationalValues, assignedNames)).toEqual(
+        result
+      );
+
+      // A name the agent was not given is still searched, and refused when it holds a customer value.
+      expect(() =>
+        sanitizeAgentWorkResult(
+          {
+            ...result,
+            runtimeInstance: { ...result.runtimeInstance, containerName: `${containerName}-2` },
+          },
+          envVars,
+          operationalValues,
+          assignedNames
+        )
+      ).toThrow("Agent work result conflicts with protected environment material");
+      expect(() =>
+        sanitizeAgentWorkResult(
+          { ...result, imageUrl: "nouva-app:0d6b2e17-9b7d-4e21-8c44-5a1f0c3e0f3a" },
+          envVars,
+          operationalValues,
+          assignedNames
+        )
+      ).toThrow("Agent work result conflicts with protected environment material");
+      // Free text is searched as before: an assigned name inside it is redacted, never refused.
+      const reported = sanitizeAgentWorkResult(
+        { ...result, statusMessage: `Started ${containerName} with SECRET_KEY=${secret}` },
+        envVars,
+        operationalValues,
+        assignedNames
+      );
+      expect(JSON.stringify(reported)).not.toContain(secret);
+      expect(reported?.statusMessage).toBe(
+        `Started nouva-[REDACTED]-${serviceId.slice(0, 8)}-${deploymentId.slice(0, 8)} with SECRET_KEY=[REDACTED]`
+      );
+    });
+
+    test("reports a redeploy after an instant rollback to an older deployment's image", async () => {
+      // An instant rollback records the image it reverted to under its own deployment id, so the
+      // live image named neither id in the runtime metadata and every later result that reported
+      // it was refused, as on `main`.
+      const envVars = { FLASK_APP: "app", SECRET_KEY: secret };
+      const firstDeploymentId = "hcgt459atqvtn0mmg75m4024";
+      const rollbackDeploymentId = "0b9e4d2c-7a1f-4c3e-8d5b-6e2f1a9c4b08";
+      const rollbackRelease: FlaskSiteRelease = {
+        deploymentId: rollbackDeploymentId,
+        runtimeMetadata: {
+          ...liveRuntimeMetadata,
+          previousImage: {
+            reference: `nouva-app:${firstDeploymentId}`,
+            imageId: "sha256:7e0c3a6d2b8f4e1c7a0d9b3e6f2c5a8d1b4e7f0c4c1e7a9d0b3f6e2c8a5d1b7f",
+            deploymentId: firstDeploymentId,
+            commitHash: "7b3c91c7e2b9a41d3f4a6b9e8c5f0d2a0f3a9d6b",
+          },
+        },
+      };
+      const rollbackImage = `nouva-app:${firstDeploymentId}`;
+      const rollback = await deployFlaskSite(envVars, rollbackImage, rollbackRelease);
+      expect(rollback.runtimeMetadata.currentImage).toMatchObject({
+        reference: rollbackImage,
+        deploymentId: rollbackDeploymentId,
+      });
+      const rolledBack = readLeasedPayload(
+        { ...appRuntimePayload, envVars, imageUrl: rollbackImage },
+        rollbackRelease
+      );
+      expect(
+        sanitizeAgentWorkResult(
+          rollback,
+          envVars,
+          rolledBack.operationalValues,
+          rolledBack.assignedNames
+        )
+      ).toEqual(rollback);
+
+      const redeployRelease: FlaskSiteRelease = {
+        deploymentId,
+        runtimeMetadata: rollback.runtimeMetadata,
+      };
+      const redeploy = await deployFlaskSite(envVars, `nouva-app:${deploymentId}`, redeployRelease);
+      expect(redeploy.runtimeMetadata.previousImage).toMatchObject({
+        reference: rollbackImage,
+        deploymentId: rollbackDeploymentId,
+      });
+      const redeployed = readLeasedPayload({ ...appPayload, envVars }, redeployRelease);
+      expect(
+        sanitizeAgentWorkResult(
+          redeploy,
+          envVars,
+          redeployed.operationalValues,
+          redeployed.assignedNames
+        )
+      ).toEqual(redeploy);
+    });
+
+    test("still refuses a result whose hostname holds a customer value, as before", async () => {
+      // The subdomain is the customer's choice, so it is searched like any text they typed.
+      const envVars = { FLASK_APP: "app", SITE: "flask", SECRET_KEY: secret };
+      const result = await deployFlaskSite(envVars, `nouva-app:${deploymentId}`);
+      const { operationalValues, assignedNames } = readLeasedPayload({ ...appPayload, envVars });
+
+      expect(() =>
+        sanitizeAgentWorkResult(result, envVars, operationalValues, assignedNames)
+      ).toThrow("Agent work result conflicts with protected environment material");
+    });
+
+    test("still refuses a result whose deployed image holds a customer value, as before", async () => {
+      // An image the agent did not derive from the ids, such as one the payload names, is searched
+      // like any other text, even though the payload declares it.
+      const envVars = { FLASK_APP: "app", SECRET_KEY: secret };
+      const imageUrl = "ghcr.io/acme/flask-app:latest";
+      const result = await deployFlaskSite(envVars, imageUrl);
+      const { operationalValues, assignedNames } = readLeasedPayload({
+        imageUrl,
+        commitHash: "5f0d2a7b3c91c7e2b9a41d3f4a6b9e8c0f3a9d6b",
+        commitMessage: "feat: flask",
+        projectId: "proj_1",
+        envVars,
+        resourceLimits,
+      });
+
+      expect(result).toMatchObject({ imageUrl, runtimeInstance: { image: imageUrl } });
+      expect(operationalValues).toContain(imageUrl);
+      expect(() =>
+        sanitizeAgentWorkResult(result, envVars, operationalValues, assignedNames)
+      ).toThrow("Agent work result conflicts with protected environment material");
+    });
   });
 
   test("drops an ambiguous failure result instead of leaking or corrupting identifiers", () => {
@@ -4917,6 +5172,188 @@ describe("deployAppImageWithDependencies", () => {
         `http://${liveName}:8080`,
       ],
     ]);
+  });
+
+  // #465: the single-writer quiesce stops a volume app's previous container and a failed deploy
+  // starts it again by hand, which clears Docker's restart count. A release that serves for a
+  // while between crashes then passes a readiness check from a fresh start.
+  const volumeAppPreviousReleases = {
+    "was crash-looping": {
+      // Up and reachable between crashes, restarted three times in the last minute.
+      RestartCount: 6,
+      upForMs: 15_000,
+      exitsMsAgo: [15_000, 35_000, 55_000],
+    },
+    "recovered from restarts long before this deploy": {
+      RestartCount: 2,
+      upForMs: 14 * 24 * 60 * 60_000,
+      exitsMsAgo: [14 * 24 * 60 * 60_000, 15 * 24 * 60 * 60_000],
+    },
+  } as const;
+
+  test.each([
+    ["the volume snapshot", "aborted_before_cutover", "was crash-looping", false],
+    [
+      "the volume snapshot",
+      "aborted_before_cutover",
+      "recovered from restarts long before this deploy",
+      true,
+    ],
+    ["candidate readiness", "aborted_before_cutover", "was crash-looping", false],
+    [
+      "candidate readiness",
+      "aborted_before_cutover",
+      "recovered from restarts long before this deploy",
+      true,
+    ],
+    ["cutover", "rolled_back", "was crash-looping", false],
+    ["cutover", "rolled_back", "recovered from restarts long before this deploy", true],
+  ] as const)("when %s fails, a volume app reports as %s whether a restored previous release that %s serves", async (failure, outcome, history, serves) => {
+    const liveName = "nouva-app-svc_1-live";
+    const candidateName = "nouva-app-svc_1-dep_1";
+    const previous = volumeAppPreviousReleases[history];
+    const deployedAt = Date.now();
+    const docker = createDockerMock();
+    // Docker's event log: the live container's exits before this deploy.
+    docker.countContainerExits.mockImplementation(async (containerId, sinceMs, untilMs) =>
+      containerId === "ctr_live"
+        ? previous.exitsMsAgo.filter(
+            (msAgo) => deployedAt - msAgo >= sinceMs && deployedAt - msAgo <= untilMs
+          ).length
+        : 0
+    );
+    let live: DockerContainerInspection = {
+      Id: "ctr_live",
+      Name: liveName,
+      RestartCount: previous.RestartCount,
+      State: {
+        Running: true,
+        Status: "running",
+        ExitCode: 0,
+        OOMKilled: false,
+        StartedAt: new Date(deployedAt - previous.upForMs).toISOString(),
+      },
+      NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.9" } } },
+    };
+    docker.stopContainer.mockImplementation(async (name: string) => {
+      if (name === liveName) {
+        live = { ...live, State: { Running: false, Status: "exited", ExitCode: 0 } };
+      }
+    });
+    // Like Docker's, a start by hand clears the restart count.
+    docker.startContainer.mockImplementation(async (name: string) => {
+      if (name === liveName) {
+        live = {
+          ...live,
+          RestartCount: 0,
+          State: {
+            Running: true,
+            Status: "running",
+            ExitCode: 0,
+            OOMKilled: false,
+            StartedAt: new Date().toISOString(),
+          },
+        };
+      }
+    });
+    if (failure === "the volume snapshot") {
+      docker.waitContainer.mockImplementationOnce(async () => 1);
+      docker.containerLogs.mockImplementationOnce(async () => "Insufficient snapshot capacity");
+    }
+    docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    let candidateRemoved = false;
+    docker.removeContainer.mockImplementation(async (name: string) => {
+      if (name === candidateName) candidateRemoved = true;
+    });
+    docker.inspectContainer.mockImplementation(async (name: string) => {
+      if (name === liveName) return live;
+      if (name !== candidateName || candidateRemoved) return null;
+      return failure === "cutover"
+        ? {
+            Id: "ctr_candidate",
+            Name: name,
+            State: { Running: true, Status: "running" },
+            NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.10" } } },
+          }
+        : { Id: "ctr_candidate", Name: name, State: { Running: false, Status: "exited" } };
+    });
+    // Traefik never confirms the candidate, so a cutover to it fails; the route back is confirmed.
+    let routedUrl = `http://${liveName}:8080`;
+    const writeLocalTraefikRoute = mock(
+      async (_paths: unknown, _serviceId: string, _hostnames: unknown, nextUrl: string) => {
+        routedUrl = nextUrl;
+      }
+    );
+    const consoleWarn = spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const failed = await deployAppImageWithDependencies(
+        {
+          ensureBaseRuntime: async () => undefined,
+          checkTcpConnect: mock(async () => true),
+          fetchImpl: mock(async () =>
+            Response.json([
+              {
+                name: "svc-svc_1@file",
+                loadBalancer: {
+                  servers: [
+                    {
+                      url:
+                        routedUrl === `http://${candidateName}:8080`
+                          ? "http://wrong-target:8080"
+                          : routedUrl,
+                    },
+                  ],
+                },
+              },
+            ])
+          ) as unknown as typeof fetch,
+          writeLocalTraefikRoute,
+          deleteLocalTraefikRoute: mock(async () => {}),
+        },
+        docker as never,
+        runtimeConfig,
+        {
+          ...appRuntimePayload,
+          rollout: createRolloutConfig(),
+          runtimeMetadata: { containerName: liveName, internalPort: 8080 },
+        }
+      ).then(
+        () => null,
+        (error: unknown) => error
+      );
+
+      expect(failed).toMatchObject({
+        result: {
+          rollout: expect.objectContaining({
+            strategy: "single_writer_snapshot_cutover",
+            outcome,
+            liveRuntimePreserved: serves,
+            activeContainerName: liveName,
+          }),
+        },
+      });
+      expect(
+        consoleWarn.mock.calls.filter(
+          ([message]) =>
+            message === `[nouva-agent] previous container ${liveName} cannot take traffic back`
+        )
+      ).toEqual(
+        serves
+          ? []
+          : [
+              [
+                expect.any(String),
+                `Previous container ${liveName} keeps restarting (3 restarts); the process is exiting instead of serving traffic`,
+              ],
+            ]
+      );
+      // Either way the traffic goes back to it: it is the only release that can run.
+      expect(docker.startContainer).toHaveBeenCalledWith(liveName);
+      expect(routedUrl).toBe(`http://${liveName}:8080`);
+    } finally {
+      consoleWarn.mockRestore();
+    }
   });
 
   test.each([

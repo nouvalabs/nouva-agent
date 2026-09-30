@@ -1,6 +1,7 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import {
   countRecentRestarts,
+  countRestartLoop,
   hasOutlastedRestartLoop,
   readRestartCount,
 } from "./container-restarts.js";
@@ -98,6 +99,27 @@ describe("hasOutlastedRestartLoop", () => {
     expect(
       hasOutlastedRestartLoop({ Id: "ctr_1", State: { ...state, StartedAt: "" } }, NOW, 3)
     ).toBe(false);
+  });
+});
+
+describe("countRestartLoop", () => {
+  const exits = [15_000, 35_000, 55_000];
+  const upFor = (msAgo: number) => ({
+    Id: "ctr_1",
+    RestartCount: 6,
+    State: { Running: true, Status: "running", StartedAt: new Date(NOW - msAgo).toISOString() },
+  });
+
+  test("counts the recent restarts of a container still in its loop", async () => {
+    await expect(
+      countRestartLoop(eventLog(exits), "nouva-app-1", upFor(15_000), NOW, 2)
+    ).resolves.toBe(3);
+  });
+
+  test("counts none for a container that has outlasted its loop", async () => {
+    await expect(
+      countRestartLoop(eventLog([160_000, 170_000]), "nouva-app-1", upFor(150_000), NOW, 2)
+    ).resolves.toBe(0);
   });
 });
 

@@ -421,6 +421,7 @@ describe("traefik-runtime", () => {
     async function reconcileCurrent(input: {
       notFound: string;
       networkStillExists: boolean;
+      status?: number;
     }): Promise<{ failure: unknown; connected: string[] }> {
       tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
       const paths = getTraefikRuntimePaths(tempDir);
@@ -437,7 +438,7 @@ describe("traefik-runtime", () => {
         connectNetwork: mock(async (network: string) => {
           if (network === "nouva-project-one") {
             throw new DockerApiError(
-              404,
+              input.status ?? 404,
               "POST",
               `/v1.52/networks/${network}/connect`,
               input.notFound
@@ -478,6 +479,128 @@ describe("traefik-runtime", () => {
       });
 
       expect((failure as Error).message).toContain("No such container: nouva-traefik");
+    });
+
+    test("still fails when Docker errors on a network deleted since the listing", async () => {
+      const { failure } = await reconcileCurrent({
+        notFound: '{"message":"network nouva-project-one is being removed"}',
+        networkStillExists: false,
+        status: 500,
+      });
+
+      expect((failure as Error).message).toContain("is being removed");
+    });
+  });
+
+  // #468: a connect that fails after a Traefik container is created must take the same cleanup,
+  // rollback and failure-recording path as a failed health check.
+  describe("when connecting a new Traefik container to a project network fails", () => {
+    async function replaceTraefik(failingContainer: string) {
+      tempDir = await mkdtemp(path.join(tmpdir(), "nouva-agent-traefik-"));
+      const paths = getTraefikRuntimePaths(tempDir);
+      await ensureTraefikState(paths);
+      await writeTraefikRouteFile(paths, "svc_1", ["frontend.up.nouva.cloud"], "http://svc_1:3000");
+      const stateHash = createTraefikStateHash(renderTraefikStaticConfig(paths));
+      const dockerState: Record<string, DockerContainerInspection | null> = {
+        [TRAEFIK_CONTAINER_NAME]: createTraefikInspection({ image: "traefik:v3.4", stateHash }),
+      };
+      let connectFailed = false;
+      const docker = {
+        ensureNetwork: mock(async () => {}),
+        listNetworks: mock(async () => [
+          {
+            Id: "network-1",
+            Name: "nouva-project-one",
+            Labels: { "nouva.managed": "true", "nouva.project.id": "project-1" },
+          },
+        ]),
+        connectNetwork: mock(async (network: string, container: string) => {
+          if (container === failingContainer && !connectFailed) {
+            connectFailed = true;
+            throw new DockerApiError(
+              500,
+              "POST",
+              `/v1.52/networks/${network}/connect`,
+              '{"message":"failed to add interface to sandbox"}'
+            );
+          }
+        }),
+        inspectNetwork: mock(async (network: string) => ({ Name: network })),
+        pullImage: mock(async () => {}),
+        removeContainer: mock(async (name: string) => {
+          dockerState[name] = null;
+        }),
+        inspectContainer: mock(async (name: string) => dockerState[name] ?? null),
+        ensureContainer: mock(
+          async (spec: { name: string; image: string; labels?: Record<string, string> }) => {
+            dockerState[spec.name] = createTraefikInspection({
+              name: spec.name,
+              image: spec.image,
+              adminPort:
+                spec.name === TRAEFIK_CANDIDATE_CONTAINER_NAME
+                  ? TRAEFIK_CANDIDATE_ADMIN_PORT
+                  : TRAEFIK_ADMIN_PORT,
+              stateHash: spec.labels?.[TRAEFIK_CONFIG_HASH_LABEL] ?? stateHash,
+            });
+            return spec.name;
+          }
+        ),
+      };
+      const fetchImpl: typeof fetch = mock(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/ping")) {
+          return new Response("OK", { status: 200 });
+        }
+        if (url.endsWith("/api/http/routers")) {
+          return Response.json([
+            { name: "http-svc_1@file", provider: "file", rule: "Host(`frontend.up.nouva.cloud`)" },
+            { name: "https-svc_1@file", provider: "file", rule: "Host(`frontend.up.nouva.cloud`)" },
+          ]);
+        }
+        return new Response("not found", { status: 404 });
+      }) as typeof fetch;
+
+      const failure = await reconcileTraefikRuntime(docker as never, runtimeConfig, {
+        dataVolume: "nouva-agent-data",
+        paths,
+        fetchImpl,
+        timeoutMs: 20,
+        intervalMs: 1,
+      }).then(
+        () => null,
+        (error: unknown) => error
+      );
+      const checks = await collectTraefikValidationChecks(docker as never, { paths, fetchImpl });
+      return {
+        failure,
+        createdImages: docker.ensureContainer.mock.calls.map((call) => call[0].image),
+        dockerState,
+        containerCheck: checks.find((check) => check.key === "traefik-container"),
+      };
+    }
+
+    test("rolls the cutover back to the previous image and records the failure", async () => {
+      const { failure, createdImages, dockerState, containerCheck } =
+        await replaceTraefik(TRAEFIK_CONTAINER_NAME);
+
+      expect((failure as Error).message).toContain("failed to add interface to sandbox");
+      expect(createdImages).toEqual([TRAEFIK_IMAGE, TRAEFIK_IMAGE, "traefik:v3.4"]);
+      expect(dockerState[TRAEFIK_CONTAINER_NAME]?.Config?.Image).toBe("traefik:v3.4");
+      expect(dockerState[TRAEFIK_CANDIDATE_CONTAINER_NAME]).toBeNull();
+      expect(containerCheck?.message).toContain("last reconcile failed during cutover");
+      expect(containerCheck?.message).toContain("(rollback succeeded)");
+    });
+
+    test("removes the preflight candidate and records the failure", async () => {
+      const { failure, createdImages, dockerState, containerCheck } = await replaceTraefik(
+        TRAEFIK_CANDIDATE_CONTAINER_NAME
+      );
+
+      expect((failure as Error).message).toContain("failed to add interface to sandbox");
+      expect(createdImages).toEqual([TRAEFIK_IMAGE]);
+      expect(dockerState[TRAEFIK_CONTAINER_NAME]?.Config?.Image).toBe("traefik:v3.4");
+      expect(dockerState[TRAEFIK_CANDIDATE_CONTAINER_NAME]).toBeNull();
+      expect(containerCheck?.message).toContain("last reconcile failed during preflight");
     });
   });
 

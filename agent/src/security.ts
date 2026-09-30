@@ -59,12 +59,15 @@ export function createBuildLogRedactor(
   });
 }
 
+/** `assignedNames` are the names derived from the work's ids; see `LogRedactionOptions`. */
 export function sanitizeSensitiveValue(
   value: unknown,
   environmentVariables?: EnvironmentVariableMap,
-  operationalValues: readonly string[] = []
+  operationalValues: readonly string[] = [],
+  assignedNames: readonly string[] = []
 ): unknown {
   return sanitizeLogValue(value, {
+    assignedNames,
     ...(environmentVariables ? { environmentVariables } : {}),
     operationalValues,
   });
@@ -81,9 +84,11 @@ export function sanitizeSensitiveValue(
 export function sanitizeSensitiveProtocolValue(
   value: unknown,
   environmentVariables: EnvironmentVariableMap,
-  operationalValues: readonly string[] = []
+  operationalValues: readonly string[] = [],
+  assignedNames: readonly string[] = []
 ): unknown {
   return sanitizeLogValue(value, {
+    assignedNames,
     operationalValues,
     preserveObjectKeys: true,
     secretValues: [

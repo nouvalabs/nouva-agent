@@ -70,3 +70,20 @@ export function hasOutlastedRestartLoop(
     Date.parse(state.StartedAt ?? "") <= until - RECENT_EXIT_WINDOW_MS / loopThreshold
   );
 }
+
+/**
+ * The restarts of the loop the container is in at `until`: its recent restarts, or none once it has
+ * outlasted a loop of `loopThreshold` of them. A rollout that stops a container it may start again
+ * reads this first: the start by hand clears the restart count, and with it every trace of the loop.
+ */
+export async function countRestartLoop(
+  docker: Pick<DockerApiClient, "countContainerExits">,
+  containerName: string,
+  inspection: DockerContainerInspection,
+  until: number,
+  loopThreshold: number
+): Promise<number> {
+  return hasOutlastedRestartLoop(inspection, until, loopThreshold)
+    ? 0
+    : await countRecentRestarts(docker, containerName, inspection, until);
+}

@@ -2,7 +2,12 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import {
+  collectAgentWorkAssignedNames,
+  collectAgentWorkPayloadOperationalValues,
+} from "@repo/runtime/logging";
 import type { DockerContainerInspection, DockerContainerSpec } from "./docker-api.js";
+import { sanitizeAgentWorkResult } from "./index.js";
 import type { WorkerDeployOnlyPayload, WorkerJobPayload } from "./protocol.js";
 import {
   buildWorkerContainerSpec,
@@ -95,6 +100,10 @@ function createRuntimeDocker() {
     },
   };
 
+  // Like Docker's, the log records an exit for a stop by hand too.
+  const logExit = (container: DockerContainerInspection) =>
+    exits.set(container.Id, [...(exits.get(container.Id) ?? []), now]);
+
   const findContainer = (identifier: string) =>
     containers.get(identifier) ??
     [...containers.values()].find((container) => container.Id === identifier) ??
@@ -166,6 +175,7 @@ function createRuntimeDocker() {
         Status: "exited",
         ExitCode: signal === "SIGKILL" ? 137 : 0,
       };
+      logExit(container);
       return true;
     }),
     listContainersByLabels: mock(async (labels: Record<string, string>) =>
@@ -196,11 +206,14 @@ function createRuntimeDocker() {
       const container = findContainer(identifier);
       if (!container) throw new Error(`Missing ${identifier}`);
       events.push(`start ${container.Name}`);
+      // Like Docker's, a start by hand clears the restart count.
+      container.RestartCount = 0;
       container.State = { Running: true, Status: "running", ExitCode: 0 };
     }),
     stopContainer: mock(async (identifier: string) => {
       const container = findContainer(identifier);
       if (container) {
+        if (container.State?.Running) logExit(container);
         container.State = { Running: false, Status: "exited", ExitCode: 137 };
       }
     }),
@@ -747,6 +760,154 @@ describe("worker convergence and cleanup", () => {
 
     expect(containers.size).toBe(0);
     expect(result.runtimeInstances).toEqual([]);
+  });
+});
+
+describe("worker results the agent reports", () => {
+  test("reports a worker whose customer values are words of the names it was given", async () => {
+    // Regression for #451: `ROLE=worker` was redacted inside every `nouva-worker-…` replica name
+    // and the instances' `worker` kind, so the agent refused the result of a running worker.
+    const serviceId = "8e3b1f6a-2c4d-4a7e-9f05-b1d3c6e8a027";
+    const deploymentId = "4d7a2e9c-6b1f-4e38-a5c0-3f8d1b6e9a24";
+    const secret = "sentinel-private-value";
+    const envVars = { ROLE: "worker", SECRET_KEY: secret };
+    const containerIds = [
+      "a3c5e7f9b1d2046e8a0c2e4f6b8d1a3c5e7f9b0d2e4a6c8f1b3d5e7a9c0e2f4b",
+      "c1e3a5f7d9b0284c6e8a1f3b5d7c9e0a2f4b6d8e1c3a5f7b9d0e2c4a6f8b1d3e",
+    ];
+    const { containers, docker } = createRuntimeDocker();
+    docker.inspectImage.mockImplementation(async () => ({
+      Id: "sha256:5e8b2d4f7a1c3e6b9d0f2a5c8e1b4d7f0a3c6e9b2d5f8a1c4e7b0d3f6a9c2e5b",
+      Config: { Entrypoint: ["node"], Cmd: ["dist/main.js"] },
+    }));
+    docker.ensureContainer.mockImplementation(async (spec: DockerContainerSpec) => {
+      const id = containerIds[containers.size] ?? spec.name;
+      containers.set(spec.name, {
+        Id: id,
+        Name: spec.name,
+        Config: { Image: spec.image, Labels: spec.labels },
+        State: { Running: true, Status: "running", Health: { Status: "healthy" }, ExitCode: 0 },
+      });
+      return id;
+    });
+
+    const result = await deployWorkerRuntime(docker as never, environment, {
+      ...workerPayload,
+      serviceId,
+      deploymentId,
+      serviceName: "emails",
+      envVars,
+      imageUrl: `nouva-app:${deploymentId}`,
+      healthCheckCommand: "true",
+      replicaCount: 2,
+    });
+    // The build-and-deploy payload as leased: it names no replica or image, only the ids and the
+    // replica count the agent derives them from.
+    const leased = {
+      repoUrl: "https://example.com/emails.git",
+      commitHash: workerPayload.commitHash,
+      commitMessage: workerPayload.commitMessage,
+      branch: "main",
+      serviceName: "emails",
+      projectId: workerPayload.projectId,
+      serviceId,
+      deploymentId,
+      envVars,
+      startCommand: null,
+      healthCheckCommand: "true",
+      replicaCount: 2,
+      runtimeMetadata: null,
+    };
+    const operationalValues = collectAgentWorkPayloadOperationalValues(leased);
+    const assignedNames = collectAgentWorkAssignedNames(leased);
+
+    expect(result.runtimeInstances).toEqual([
+      expect.objectContaining({
+        kind: "worker",
+        containerName: buildWorkerReplicaContainerName(serviceId, deploymentId, 0),
+      }),
+      expect.objectContaining({
+        kind: "worker",
+        containerName: buildWorkerReplicaContainerName(serviceId, deploymentId, 1),
+      }),
+    ]);
+    expect(sanitizeAgentWorkResult(result, envVars, operationalValues, assignedNames)).toEqual(
+      result
+    );
+
+    // A replica the payload did not ask for is not one of its names, so it is searched and refused.
+    expect(() =>
+      sanitizeAgentWorkResult(
+        {
+          ...result,
+          runtimeInstance: {
+            kind: "worker",
+            containerName: buildWorkerReplicaContainerName(serviceId, deploymentId, 2),
+          },
+        },
+        envVars,
+        operationalValues,
+        assignedNames
+      )
+    ).toThrow("Agent work result conflicts with protected environment material");
+  });
+
+  test("reports a worker scaled after an instant rollback to an older deployment's image", async () => {
+    // An instant rollback records the image it reverted to under its own deployment id, so the
+    // live image named neither id in the runtime metadata and a later scale, which reports it,
+    // was refused, as on `main`.
+    const serviceId = "8e3b1f6a-2c4d-4a7e-9f05-b1d3c6e8a027";
+    const firstDeploymentId = "hcgt459atqvtn0mmg75m4024";
+    const secondDeploymentId = "a1v1j6bzzphqjjezyf86yjve";
+    const rollbackDeploymentId = "e41d8b07-3c5a-4f92-b6e1-7d0c9a2f5b38";
+    const envVars = { FLASK_APP: "app", SECRET_KEY: "sentinel-private-value" };
+    const { clock, docker } = createRuntimeDocker();
+    let liveRuntimeMetadata: WorkerDeployOnlyPayload["runtimeMetadata"] = null;
+
+    /** Rolls out a release as the agent leases it, and returns what it would report. */
+    async function release(deploymentId: string, imageUrl: string, replicaCount: number) {
+      const payload: WorkerDeployOnlyPayload = {
+        ...workerPayload,
+        serviceId,
+        deploymentId,
+        serviceName: "emails",
+        envVars,
+        imageUrl,
+        healthCheckCommand: "true",
+        replicaCount,
+        runtimeMetadata: liveRuntimeMetadata,
+      };
+      const result = await deployWorkerRuntime(docker as never, environment, payload, { clock });
+      liveRuntimeMetadata = result.runtimeMetadata as WorkerDeployOnlyPayload["runtimeMetadata"];
+      return {
+        result,
+        reported: sanitizeAgentWorkResult(
+          result,
+          envVars,
+          collectAgentWorkPayloadOperationalValues(payload),
+          collectAgentWorkAssignedNames(payload)
+        ),
+      };
+    }
+
+    const rollbackImage = `nouva-app:${firstDeploymentId}`;
+    await release(firstDeploymentId, rollbackImage, 2);
+    await release(secondDeploymentId, `nouva-app:${secondDeploymentId}`, 2);
+    const rollback = await release(rollbackDeploymentId, rollbackImage, 2);
+    expect(rollback.result.runtimeMetadata).toMatchObject({
+      currentImage: { reference: rollbackImage, deploymentId: rollbackDeploymentId },
+    });
+    expect(rollback.reported).toEqual(rollback.result);
+
+    // Scaling keeps the live deployment's id and image.
+    const scale = await release(rollbackDeploymentId, rollbackImage, 1);
+    expect(scale.result.runtimeInstances).toEqual([
+      expect.objectContaining({
+        image: rollbackImage,
+        containerName: buildWorkerReplicaContainerName(serviceId, rollbackDeploymentId, 0),
+      }),
+    ]);
+    expect(scale.reported).toEqual(scale.result);
   });
 });
 
@@ -1478,6 +1639,111 @@ describe("worker rollouts around stopped leftovers", () => {
         liveRuntimePreserved: true,
         rollbackCompleted: true,
         activeContainerNames: [previous],
+      })
+    );
+  });
+
+  // #465: a stop-first rollout stops the previous worker and a failed one starts it again by hand,
+  // which clears Docker's restart count. A worker that runs for a while between crashes then
+  // passes a readiness check from a fresh start.
+  const DAY_MS = 24 * 60 * 60_000;
+  const previousWorkers = {
+    "was crash-looping": {
+      RestartCount: 40,
+      upForMs: 15_000,
+      exitsMsAgo: [15_000, 35_000, 55_000],
+    },
+    // The stop by hand logs a third recent exit, after the restarts were read.
+    "restarted twice recently": { RestartCount: 2, upForMs: 15_000, exitsMsAgo: [15_000, 40_000] },
+    "outlasted a burst of restarts shortly before this deploy": {
+      RestartCount: 5,
+      upForMs: 120_000,
+      exitsMsAgo: [120_000, 140_000, 160_000],
+    },
+    "recovered from restarts long before this deploy": {
+      RestartCount: 3,
+      upForMs: 14 * DAY_MS,
+      exitsMsAgo: [14 * DAY_MS, 15 * DAY_MS, 16 * DAY_MS],
+    },
+  } as const;
+  const workerVolume = { volumeId: "vol_1", volumeName: "nouva-vol-1", mountPath: "/data" };
+
+  function giveHistory(
+    fake: ReturnType<typeof createRuntimeDocker>,
+    containerName: string,
+    history: keyof typeof previousWorkers
+  ): void {
+    const container = fake.containers.get(containerName) as DockerContainerInspection;
+    const before = previousWorkers[history];
+    container.RestartCount = before.RestartCount;
+    fake.exits.set(
+      container.Id,
+      before.exitsMsAgo.map((msAgo) => fake.clock.now() - msAgo)
+    );
+    container.State = { ...container.State, StartedAt: startedMsAgo(fake, before.upForMs) };
+  }
+
+  test.each([
+    ["a no_overlap worker", "was crash-looping", false, null],
+    ["a no_overlap worker", "restarted twice recently", true, null],
+    ["a no_overlap worker", "outlasted a burst of restarts shortly before this deploy", true, null],
+    ["a no_overlap worker", "recovered from restarts long before this deploy", true, null],
+    ["a volume worker", "was crash-looping", false, workerVolume],
+    ["a volume worker", "recovered from restarts long before this deploy", true, workerVolume],
+  ] as const)("a failed stop-first rollout of %s reports whether a previous version that %s runs", async (_label, history, runs, volume) => {
+    const fake = createRuntimeDocker();
+    const releaseWith = (deploymentId: string) => ({ ...release(deploymentId, 1), volume });
+    const runtimeMetadata = await deployLive(fake, releaseWith("dep_1"));
+    const previous = replicaName("dep_1", 0);
+    giveHistory(fake, previous, history);
+    crashNextCandidates(fake);
+
+    const failure = await deployWorkerRuntime(
+      fake.docker as never,
+      environment,
+      { ...releaseWith("dep_2"), runtimeMetadata },
+      { clock: fake.clock }
+    ).catch((error: unknown) => error);
+
+    // Either way it is started again: it is the only version that can run.
+    expect(fake.containers.get(previous)?.State?.Running).toBe(true);
+    expect((failure as WorkerRolloutError).result.rollout).toEqual(
+      expect.objectContaining({
+        outcome: "aborted_before_cutover",
+        liveRuntimePreserved: runs,
+        rollbackCompleted: runs,
+        activeContainerNames: [previous],
+      })
+    );
+  });
+
+  test.each([
+    ["was crash-looping", "recovered from restarts long before this deploy", true],
+    ["recovered from restarts long before this deploy", "was crash-looping", true],
+    ["was crash-looping", "was crash-looping", false],
+  ] as const)("a failed stop-first rollout restores every previous replica, when the first %s and the second %s", async (first, second, runs) => {
+    const fake = createRuntimeDocker();
+    const runtimeMetadata = await deployLive(fake, release("dep_1", 2));
+    const previous = [replicaName("dep_1", 0), replicaName("dep_1", 1)];
+    giveHistory(fake, previous[0] as string, first);
+    giveHistory(fake, previous[1] as string, second);
+    crashNextCandidates(fake);
+
+    const failure = await deployWorkerRuntime(
+      fake.docker as never,
+      environment,
+      { ...release("dep_2", 2), runtimeMetadata },
+      { clock: fake.clock }
+    ).catch((error: unknown) => error);
+
+    // A replica that does not run is back as it was, and the service runs if any other does.
+    expect(previous.map((name) => fake.containers.get(name)?.State?.Running)).toEqual([true, true]);
+    expect((failure as WorkerRolloutError).result.rollout).toEqual(
+      expect.objectContaining({
+        outcome: "aborted_before_cutover",
+        liveRuntimePreserved: runs,
+        rollbackCompleted: runs,
+        activeContainerNames: previous,
       })
     );
   });
