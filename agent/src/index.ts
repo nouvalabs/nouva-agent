@@ -6,6 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { AGENT_VOLUME_METRICS_INTERVAL_MS } from "@repo/runtime/agent-metrics";
 import {
+  collectExternalBackupImportProofVocabularyFields,
   EXTERNAL_BACKUP_IMPORT_HEADER_SAMPLE_BYTES,
   type ExternalBackupImportFailureCategory,
   type ExternalBackupImportProofV1,
@@ -1945,12 +1946,19 @@ function keepRuntimeInstanceKind(instance: unknown, sanitized: unknown): unknown
     : sanitized;
 }
 
+function keepImportProofVocabulary(proof: unknown, sanitized: unknown): unknown {
+  return typeof sanitized === "object" && sanitized !== null && !Array.isArray(sanitized)
+    ? { ...sanitized, ...collectExternalBackupImportProofVocabularyFields(toObject(proof)) }
+    : sanitized;
+}
+
 /**
  * Sanitizes one protocol field. A rollout's strategy, outcome and phase, and its worker shutdown
  * fields, keep their closed vocabularies rather than being redacted, the same way the control plane
  * reads them, so a customer variable equal to "committed", "SIGTERM" or "previous" cannot turn a
  * finished rollout into a leak. A runtime instance keeps its kind the same way, so "app" or
- * "worker" cannot either.
+ * "worker" cannot either, and an import receipt keeps its format, variant, validation method and
+ * engine versions, so a backup retention of "2" cannot refuse an import from PostgreSQL 16.2.
  */
 function sanitizeAgentProtocolValue(
   key: (typeof AGENT_WORK_RESULT_PROTOCOL_KEYS)[number],
@@ -1967,6 +1975,9 @@ function sanitizeAgentProtocolValue(
   );
   if (key === "runtimeInstance") {
     return keepRuntimeInstanceKind(value, sanitized);
+  }
+  if (key === "importProof") {
+    return keepImportProofVocabulary(value, sanitized);
   }
   if (key === "runtimeInstances" && Array.isArray(value) && Array.isArray(sanitized)) {
     return sanitized.map((instance, index) => keepRuntimeInstanceKind(value[index], instance));

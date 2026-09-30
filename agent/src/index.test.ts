@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { buildQueuedImportExternalBackupPayload } from "@repo/runtime/external-backup-import";
 import {
   collectAgentWorkAssignedNames,
   collectAgentWorkPayloadOperationalValues,
@@ -7212,6 +7214,9 @@ describe("external backup import", () => {
     "UEdETVABEAAECAEBADgAAAAAJwAAAAARAAAAAAkAAAAACAAAAAB+AAAAAAAAAAAABwAAAGZpeHR1cmUA" +
     "HwAAADE2LjE1IChEZWJpYW4gMTYuMTUtMS5wZ2RnMTMrMikABAAAADE4LjQABwAAAABWDQAAAAAAAAAAAQAAADAAAQA=";
   const POSTGRES_SHA256 = "fb2e454c51162909c3da786edb545027752cd2f3004887bef4a7421808d0ac1e";
+  /** A real RDB snapshot written by Redis 7.2.16 (`SAVE`): RDB version 11. */
+  const REDIS_HEADER_BASE64 = "UkVESVMwMDEx+glyZWRpcy12ZXIGNy4yLjE2+gpyZWQ=";
+  const REDIS_SHA256 = "75415607b9f7dff06ae578499bc08a1fa6162c47470796ea8579993e18ed150c";
 
   function createImportPayload(overrides: Record<string, unknown> = {}) {
     return {
@@ -7341,7 +7346,7 @@ describe("external backup import", () => {
         artifactSizeBytes: 1024,
         digestVerified: true,
         headerVerified: true,
-        sourceEngineVersion: "16.15 (Debian 16.15-1.pgdg13+2)",
+        sourceEngineVersion: "16.15",
         destinationVariant: "postgres",
         destinationVersion: "17",
         validationMethod: "postgres-startup-sql-read",
@@ -7430,5 +7435,187 @@ describe("external backup import", () => {
     const cleanupSpec = docker.createContainer.mock.calls.at(-1)?.[0];
     expect(cleanupSpec?.name).toBe("nouva-import-cleanup-import_abcde");
     expect(cleanupSpec?.cmd?.[2]).toContain('rclone deletefile "$remote" || true');
+  });
+
+  describe("reporting the receipt of an import into a Nouva-managed database (#514)", () => {
+    const projectId = "k2xw8r4m0q7t1v9c3n6b5d8f";
+    const serviceId = "p4d7fa1i6g2s8t0n5j3c9e7b";
+    const serviceName = "rjvpg-q7k";
+    const sourceVolumeId = "k8s7x2q5m0a9p3z6r1t4v7w0";
+    const targetVolumeId = "o3x7f5j1k9g6s2d0x4w8p6t2";
+    const importId = "y1v5f9o3i7n2s6z0c4k8j2w6";
+    // `generateCredentials`, which the agent cannot import: a role and a database named after the
+    // service, and a random password.
+    const generatedName = `nouva_${serviceName.replace(/-/g, "_")}`;
+    const password = randomBytes(24).toString("base64url");
+    const destination = {
+      bucket: "nouva-backups",
+      endpoint: "https://s3.eu-central-003.example.com",
+      region: "eu-central-003",
+      pathStyle: true,
+      verifyTls: true,
+      accessKeyId: "AKIA4EXAMPLEIMPORT",
+      secretAccessKey: randomBytes(30).toString("base64url"),
+    };
+
+    /**
+     * The payload the agent leases: the queued contract, hydrated at lease time the way
+     * `buildDatabaseProvisionExecutorConfig` and `buildPlatformPgBackrestEnv` hydrate it, down to
+     * the platform backup destination's own pgBackRest settings.
+     */
+    function leaseImport(variant: "postgres" | "redis") {
+      const queued = buildQueuedImportExternalBackupPayload({
+        projectId,
+        serviceId,
+        serviceName,
+        variant,
+        version: variant === "postgres" ? "17" : "7.4",
+        importId,
+        format: variant === "postgres" ? "postgres-custom-dump-v1" : "redis-rdb-v1",
+        artifactSha256: variant === "postgres" ? POSTGRES_SHA256 : REDIS_SHA256,
+        artifactSizeBytes: 1024,
+        objectKey: `imports/v1/projects/${projectId}/services/${serviceId}/${importId}.artifact`,
+        sourceVolumeId,
+        sourceVolumeName: `nouva-vol-${sourceVolumeId.slice(0, 12)}`,
+        targetVolumeId,
+        targetVolumeName: `nouva-vol-${targetVolumeId.slice(0, 12)}`,
+        targetMountPath: variant === "postgres" ? "/var/lib/postgresql" : "/data",
+        destination: {
+          id: "platform-default",
+          type: "s3",
+          bucket: destination.bucket,
+          endpoint: destination.endpoint,
+          region: destination.region,
+          pathStyle: destination.pathStyle,
+          verifyTls: destination.verifyTls,
+        } as never,
+      });
+      const hydrated = {
+        ...queued,
+        destination: { ...queued.destination, ...destination },
+        credentials: { username: generatedName, password, database: generatedName },
+      };
+      if (variant === "redis") {
+        return {
+          ...hydrated,
+          imageUrl: "registry.nouva.sh/nouva/redis:7.4",
+          envVars: {},
+          containerArgs: ["redis-server", "--requirepass", password],
+          dataPath: "/data",
+        };
+      }
+      const mountPath = "/var/lib/postgresql";
+      return {
+        ...hydrated,
+        imageUrl: "registry.nouva.sh/nouva/postgres:17",
+        envVars: {
+          POSTGRES_USER: generatedName,
+          POSTGRES_PASSWORD: password,
+          POSTGRES_DB: generatedName,
+          PGDATA: `${mountPath}/pgdata`,
+          POSTGRES_SOCKET_DIR: `${mountPath}/.sockets`,
+          POSTGRES_SSL_DIR: `${mountPath}/ssl`,
+          POSTGRES_SSL_CERT_FILE: `${mountPath}/ssl/server.crt`,
+          POSTGRES_SSL_KEY_FILE: `${mountPath}/ssl/server.key`,
+          PGPASSFILE: `${mountPath}/.pgpass`,
+          PGBACKREST_REPO1_TYPE: "s3",
+          PGBACKREST_REPO1_S3_BUCKET: destination.bucket,
+          PGBACKREST_REPO1_S3_ENDPOINT: destination.endpoint,
+          PGBACKREST_REPO1_S3_REGION: destination.region,
+          PGBACKREST_REPO1_S3_KEY: destination.accessKeyId,
+          PGBACKREST_REPO1_S3_KEY_SECRET: destination.secretAccessKey,
+          PGBACKREST_REPO1_S3_URI_STYLE: "path",
+          PGBACKREST_REPO1_STORAGE_VERIFY_TLS: "y",
+          PGBACKREST_REPO1_RETENTION_FULL_TYPE: "count",
+          // Two full backups. A one-character value is matched as a whole word, and `2` is a word
+          // of the build string a Debian PostgreSQL reports: `16.15 (Debian 16.15-1.pgdg13+2)`.
+          PGBACKREST_REPO1_RETENTION_FULL: "2",
+          PGBACKREST_ARCHIVE_ASYNC: "y",
+          PGBACKREST_SPOOL_PATH: "/var/spool/pgbackrest",
+          PGBACKREST_STANZA: `vol-${sourceVolumeId}`,
+          PGBACKREST_REPO1_PATH: `/postgres/v1/projects/${projectId}/volumes/${sourceVolumeId}`,
+        },
+        containerArgs: [],
+        dataPath: `${mountPath}/pgdata`,
+      };
+    }
+
+    /** Sanitizes a result against the leased payload, as `processWorkItem` does before reporting. */
+    function report(payload: ReturnType<typeof leaseImport>, result: Record<string, unknown>) {
+      return sanitizeAgentWorkResult(
+        result,
+        payload.envVars,
+        collectAgentWorkPayloadOperationalValues(payload),
+        collectAgentWorkAssignedNames(payload)
+      );
+    }
+
+    async function runImport(payload: ReturnType<typeof leaseImport>, restoreLogs: string) {
+      const docker = createDockerMock();
+      docker.containerLogs
+        .mockResolvedValueOnce(
+          fetchLogs({
+            sha256: payload.artifactSha256,
+            sizeBytes: 1024,
+            headerBase64:
+              payload.variant === "postgres" ? POSTGRES_HEADER_BASE64 : REDIS_HEADER_BASE64,
+          })
+        )
+        .mockResolvedValueOnce(restoreLogs);
+      return await handleImportExternalBackup(docker as never, {} as never, payload as never);
+    }
+
+    test("reports the receipt of a dump taken from a Debian PostgreSQL build", async () => {
+      // Regression for #514: the receipt carried the build string the dump's server reported, the
+      // retention setting `2` was redacted out of `…pgdg13+2)`, and the agent refused the result
+      // of an import it had just staged.
+      const payload = leaseImport("postgres");
+      const result = await runImport(payload, "NOUVA_IMPORT_RESTORED:1\nNOUVA_IMPORT_RELATIONS:3");
+
+      expect(report(payload, result)).toEqual(result);
+      // The release the dump came from, which is all the control plane records and shows.
+      expect(result.importProof.sourceEngineVersion).toBe("16.15");
+    });
+
+    test("reports a source release whose number a platform setting also holds", async () => {
+      const payload = leaseImport("postgres");
+      const result = await runImport(payload, "NOUVA_IMPORT_RESTORED:1\nNOUVA_IMPORT_RELATIONS:3");
+      // PostgreSQL 16.2 beside a retention of two full backups.
+      const fromPostgres16Point2 = {
+        ...result,
+        importProof: { ...result.importProof, sourceEngineVersion: "16.2" },
+      };
+
+      expect(report(payload, fromPostgres16Point2)).toEqual(fromPostgres16Point2);
+    });
+
+    test("still refuses a receipt that repeats the database password", async () => {
+      const payload = leaseImport("postgres");
+      const result = await runImport(payload, "NOUVA_IMPORT_RESTORED:1\nNOUVA_IMPORT_RELATIONS:3");
+
+      for (const field of ["sourceEngineVersion", "destinationVersion", "targetVolumeName"]) {
+        expect(() =>
+          report(payload, {
+            ...result,
+            importProof: { ...result.importProof, [field]: `16.15 ${password}` },
+          })
+        ).toThrow("Agent work result conflicts with protected environment material");
+      }
+    });
+
+    test("reports the receipt of a Redis snapshot", async () => {
+      const payload = leaseImport("redis");
+      const result = await runImport(
+        payload,
+        "NOUVA_IMPORT_RESTORED:1\nNOUVA_IMPORT_KEYS:4\nNOUVA_IMPORT_VOLATILE_KEYS:1"
+      );
+
+      expect(result.importProof).toMatchObject({
+        sourceEngineVersion: "rdb-11",
+        destinationVersion: "7.4",
+        keyCount: 4,
+      });
+      expect(report(payload, result)).toEqual(result);
+    });
   });
 });

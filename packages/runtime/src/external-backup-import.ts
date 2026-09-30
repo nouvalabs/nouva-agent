@@ -101,7 +101,12 @@ export type ExternalBackupHeaderParse =
     };
 
 export type ExternalBackupImportVerification =
-  | { outcome: "verified"; header: ExternalBackupArtifactHeader; sourceEngineVersion: string }
+  | {
+      outcome: "verified";
+      header: ExternalBackupArtifactHeader;
+      /** The release the artifact came from, as its receipt reports it: `16.15`, `rdb-11`. */
+      sourceEngineVersion: string;
+    }
   | {
       outcome: "rejected";
       category: ExternalBackupImportFailureCategory;
@@ -366,6 +371,19 @@ export function parsePostgresMajorVersion(version: string): number | null {
 }
 
 /**
+ * The release a PostgreSQL server reports, without the build description a packager appends:
+ * `16.15` out of `16.15 (Debian 16.15-1.pgdg13+2)`.
+ *
+ * The receipt carries this rather than the whole string. The description is free text read out of
+ * the customer's archive that nothing on the control plane uses, and every word of it is one a
+ * leak check can match: the platform's backup retention `2` is a word of `…pgdg13+2)`, and the
+ * agent refused the receipt of an import it had already staged (#514).
+ */
+function readPostgresReleaseVersion(serverVersion: string): string | null {
+  return /^\s*(\d{1,3}(?:\.\d{1,3}){0,2})/.exec(serverVersion)?.[1] ?? null;
+}
+
+/**
  * Highest RDB file version each supported Redis line can load.
  *
  * Redis refuses an RDB newer than its own writer version outright, so this table is the whole
@@ -489,7 +507,8 @@ export function verifyExternalBackupArtifact(input: {
     return {
       outcome: "verified",
       header: parsed.header,
-      sourceEngineVersion: parsed.header.sourceEngineVersion,
+      sourceEngineVersion:
+        readPostgresReleaseVersion(parsed.header.sourceEngineVersion) ?? String(sourceMajor),
     };
   }
 
@@ -577,7 +596,12 @@ export function buildQueuedImportExternalBackupPayload(
   };
 }
 
-export type ExternalBackupImportValidationMethod = "postgres-startup-sql-read" | "redis-load-ping";
+const EXTERNAL_BACKUP_IMPORT_VALIDATION_METHODS = [
+  "postgres-startup-sql-read",
+  "redis-load-ping",
+] as const;
+export type ExternalBackupImportValidationMethod =
+  (typeof EXTERNAL_BACKUP_IMPORT_VALIDATION_METHODS)[number];
 
 /**
  * The import receipt. Every field is something the agent observed rather than something it was
@@ -655,6 +679,54 @@ export function isValidExternalBackupImportProof(input: {
     validationMethod === expectedMethod &&
     readString(record, "validatedAt") !== null
   );
+}
+
+/** An engine release as a receipt reports one: `17`, `7.4`, `16.15`, `9.6.24`. */
+const ENGINE_RELEASE_VERSION_PATTERN = /^\d{1,3}(?:\.\d{1,3}){0,2}$/;
+/** The RDB file version of a Redis snapshot, as a receipt reports it: `rdb-11`. */
+const RDB_SOURCE_VERSION_PATTERN = /^rdb-\d{1,4}$/;
+
+const EXTERNAL_BACKUP_IMPORT_VARIANTS: ReadonlySet<string> = new Set(
+  Object.values(EXTERNAL_BACKUP_IMPORT_VARIANT_BY_FORMAT)
+);
+
+const EXTERNAL_BACKUP_IMPORT_PROOF_VOCABULARY: Readonly<
+  Record<string, (value: string) => boolean>
+> = {
+  format: isExternalBackupImportFormat,
+  destinationVariant: (value) => EXTERNAL_BACKUP_IMPORT_VARIANTS.has(value),
+  validationMethod: (value) =>
+    (EXTERNAL_BACKUP_IMPORT_VALIDATION_METHODS as readonly string[]).includes(value),
+  destinationVersion: (value) => ENGINE_RELEASE_VERSION_PATTERN.test(value),
+  sourceEngineVersion: (value) =>
+    ENGINE_RELEASE_VERSION_PATTERN.test(value) || RDB_SOURCE_VERSION_PATTERN.test(value),
+};
+
+/**
+ * The fields of an import receipt whose value is one of the platform's own words or a bare engine
+ * release: the format, the destination's variant and the validation method, and the source and
+ * destination versions. Both ends of the agent protocol keep these as they are instead of
+ * redacting them, for the rollout vocabulary's reason (#345): none of them can carry a secret. A
+ * release is a few digits the agent parsed out of the archive's header or was told by the payload,
+ * never a value it was handed as material.
+ *
+ * A platform setting or a customer variable that happens to equal one, or a word of one, is not
+ * coming back through it. The backup retention `2` beside a dump from PostgreSQL `16.2`, or a
+ * variable set to `postgres` on a Postgres service, refused the receipt of an import the agent had
+ * already staged (#514). A value of any other shape is not returned, so it is still redacted and
+ * still fails the leak check.
+ */
+export function collectExternalBackupImportProofVocabularyFields(
+  proof: Readonly<Record<string, unknown>>
+): Record<string, string> {
+  const fields: Record<string, string> = {};
+  for (const [key, isVocabulary] of Object.entries(EXTERNAL_BACKUP_IMPORT_PROOF_VOCABULARY)) {
+    const value = Object.hasOwn(proof, key) ? proof[key] : undefined;
+    if (typeof value === "string" && isVocabulary(value)) {
+      fields[key] = value;
+    }
+  }
+  return fields;
 }
 
 export function supportsExternalBackupImport(

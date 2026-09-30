@@ -10,7 +10,7 @@
     },
     "agent": {
       "name": "nouva-agent",
-      "version": "0.4.44",
+      "version": "0.4.45",
       "dependencies": {
         "@repo/runtime": "workspace:*",
         "postgres": "^3.4.7",
