@@ -40,7 +40,8 @@ export function redactSensitiveText(
  *   of a kind — `require` from `PGSSLMODE`, `postgres` from `PGDATABASE` — is masked only where it
  *   stands as its own word. Without it the agent turned `requirements.txt` into
  *   `[REDACTED]ments.txt` before the line ever left the server, which the control plane's own fix
- *   for the same rule (#245) could not undo.
+ *   for the same rule (#245) could not undo. A port among them, such as `PGPORT=5432`, is not
+ *   masked at all (#398).
  *
  * A customer's value keeps matching anywhere it appears, however ordinary it looks, and the
  * agent's own configured secrets are never relaxed.
@@ -73,7 +74,9 @@ export function sanitizeSensitiveValue(
  * Sanitizes a protocol field whose redacted copy is compared against the original to detect a leak.
  * Unlike `sanitizeSensitiveValue` this protects variable *values* only: protocol fields carry
  * platform-generated strings, so a variable *name* matching one is not a leak, and treating names
- * as protected material turned healthy deployments into permanent failures (#187).
+ * as protected material turned healthy deployments into permanent failures (#187). For the same
+ * reason the field's own property names are left alone: they are the agent's, so `MODE=strategy`
+ * is not leaking through `rollout.strategy` (#397).
  */
 export function sanitizeSensitiveProtocolValue(
   value: unknown,
@@ -82,6 +85,7 @@ export function sanitizeSensitiveProtocolValue(
 ): unknown {
   return sanitizeLogValue(value, {
     operationalValues,
+    preserveObjectKeys: true,
     secretValues: [
       ...collectConfiguredSecretValues(),
       ...collectEnvironmentMapValues(environmentVariables),

@@ -317,6 +317,42 @@ describe("assessCandidateReadiness of a container that was already running", () 
     );
   });
 
+  test.each([
+    ["two restarts moments before the check", 2, 5],
+    ["one restart moments before the check and one it sees", 1, 6],
+  ])("reports a restart loop from %s", (_restarts, recentRestarts, restartCount) => {
+    const assessment = assessCandidateReadiness({
+      containerName: CONTAINER_NAME,
+      appPort: 8080,
+      inspection: inspect({ RestartCount: restartCount }),
+      evidence: NO_CANDIDATE_RUNTIME_EVIDENCE,
+      restartBaseline: 5,
+      recentRestarts,
+      outOfMemoryAtStart: false,
+    });
+
+    expect(assessment.evidence.restarts).toBe(2);
+    expect(assessment.step).toEqual(
+      expect.objectContaining({ kind: "failed", cause: "restart_loop" })
+    );
+  });
+
+  test("still probes a container that restarted moments before the check and then outlives a process killed for memory", () => {
+    // Only a restart the check sees shows the container going down with the flag.
+    const assessment = assessCandidateReadiness({
+      containerName: CONTAINER_NAME,
+      appPort: 8080,
+      inspection: inspect({ RestartCount: 5, state: { OOMKilled: true } }),
+      evidence: NO_CANDIDATE_RUNTIME_EVIDENCE,
+      restartBaseline: 5,
+      recentRestarts: 1,
+      outOfMemoryAtStart: false,
+    });
+
+    expect(assessment.evidence.outOfMemory).toBe(false);
+    expect(assessment.step.kind).toBe("probe");
+  });
+
   test("judges a container down with a flag it carried from before by how it went down", () => {
     const assessment = assessRunning(
       inspect({ state: { Running: false, Status: "exited", OOMKilled: true, ExitCode: 1 } }),

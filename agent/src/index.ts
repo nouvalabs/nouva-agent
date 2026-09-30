@@ -15,6 +15,7 @@ import {
 import {
   collectAgentRolloutVocabularyFields,
   collectAgentWorkPayloadOperationalValues,
+  maskAgentResultDescriptiveFields,
 } from "@repo/runtime/logging";
 import {
   decideVerificationConsequence,
@@ -786,30 +787,80 @@ const defaultDeployAppImageDependencies: DeployAppImageDependencies = {
   sleep,
 };
 
+/**
+ * How far back a readiness check of a container that kept running counts restarts it did not see.
+ * A release that serves for a while and then crashes is up for most of its loop: Docker restarts a
+ * process that ran for over ten seconds after only 100 ms, and any other after at most a minute.
+ * Finding it up and reachable then says nothing, and its recent restarts are the only evidence of
+ * the loop. Restarts older than five minutes are history the container recovered from. The
+ * lookback is best effort: Docker's event log holds only its latest few hundred events across all
+ * containers, and each health check logs three, so on a host running a few workers it may reach
+ * back only two or three minutes. A short log can only miss restarts, never report a loop that
+ * did not happen.
+ */
+const RECENT_EXIT_WINDOW_MS = 5 * 60_000;
+
+/**
+ * The restarts Docker's restart policy performed in the window before `until`. Its restart count
+ * covers the container's whole life, so the recent ones are the exits its event log records in the
+ * window. A stop by hand also logs an exit, but the start by hand that follows clears the restart
+ * count, which therefore caps them.
+ */
+async function countRecentRestarts(
+  docker: Pick<DockerApiClient, "countContainerExits">,
+  containerName: string,
+  inspection: DockerContainerInspection,
+  until: number
+): Promise<number> {
+  const restarts = readRestartCount(inspection);
+  if (restarts === 0) return 0;
+  try {
+    const exits = await docker.countContainerExits(
+      inspection.Id,
+      until - RECENT_EXIT_WINDOW_MS,
+      until
+    );
+    return Math.min(restarts, exits);
+  } catch (error) {
+    // No evidence against the container: it is judged, as before, by the restarts the check sees.
+    console.warn(
+      `[nouva-agent] could not read recent exits of container ${containerName}`,
+      error instanceof Error ? error.message : error
+    );
+    return 0;
+  }
+}
+
 async function waitForAppCandidateReadiness(
   dependencies: Pick<DeployAppImageDependencies, "checkTcpConnect">,
-  docker: Pick<DockerApiClient, "inspectContainer">,
+  docker: Pick<DockerApiClient, "inspectContainer" | "countContainerExits">,
   containerName: string,
   appPort: number,
   rollout: AppRolloutConfig,
   /**
    * For a container that kept running up to this check. Docker keeps its restart count and its
    * out-of-memory flag across its whole life, and what it recovered from long ago says nothing
-   * about now, so it is judged only by what this check observes. A candidate, or a container just
-   * started by hand (which resets both), has no history to leave out.
+   * about now, so it is judged by what this check observes and by the restarts it had moments
+   * before: those are the loop it may still be in. A candidate, or a container just started by
+   * hand (which resets both), has no history to leave out.
    */
-  { alreadyRunning = false }: { alreadyRunning?: boolean } = {}
+  {
+    alreadyRunning = false,
+    subject = "Candidate container",
+  }: { alreadyRunning?: boolean; subject?: string } = {}
 ): Promise<void> {
   const deadline = Date.now() + rollout.readiness.timeoutMs;
   let evidence = NO_CANDIDATE_RUNTIME_EVIDENCE;
   let lastError = "candidate container did not become ready";
   // Taken from the first inspection of a container that was already running.
-  let history: { restarts: number; outOfMemory: boolean } | null = null;
+  let history: { restarts: number; recentRestarts: number; outOfMemory: boolean } | null = null;
 
   while (Date.now() <= deadline) {
+    // Exits logged before this instant are already in the restart count the inspection reports.
+    const inspectedAt = Date.now();
     const inspection = await docker.inspectContainer(containerName);
     if (!inspection) {
-      throw new Error(`Candidate container ${containerName} is missing`);
+      throw new Error(`${subject} ${containerName} is missing`);
     }
 
     if (alreadyRunning) {
@@ -819,6 +870,7 @@ async function waitForAppCandidateReadiness(
       const up = state?.Running === true && state.Status?.toLowerCase() === "running";
       history ??= {
         restarts: readRestartCount(inspection),
+        recentRestarts: await countRecentRestarts(docker, containerName, inspection, inspectedAt),
         outOfMemory: up && state?.OOMKilled === true,
       };
     }
@@ -827,7 +879,9 @@ async function waitForAppCandidateReadiness(
       appPort,
       inspection,
       evidence,
+      subject,
       restartBaseline: history?.restarts,
+      recentRestarts: history?.recentRestarts,
       outOfMemoryAtStart: history?.outOfMemory,
     });
     evidence = assessment.evidence;
@@ -1830,7 +1884,7 @@ function normalizeAgentProtocolValueForConflictCheck(
     return { ...(value as Record<string, unknown>), message: "[DIAGNOSTIC]" };
   }
   if (key !== "job" || typeof value !== "object" || value === null || Array.isArray(value)) {
-    return value;
+    return maskAgentResultDescriptiveFields(key, value);
   }
 
   const job = { ...(value as Record<string, unknown>) };
@@ -3344,11 +3398,12 @@ async function runVerificationKeepingOnError(
 /**
  * Whether the previous app container could take traffic back right now, judged by the same
  * readiness check a candidate must pass before cutover. The container has kept running, so the
- * restarts and memory kills it recovered from before the check do not count against it.
+ * memory kills it recovered from before the check, and restarts from long before it, do not count
+ * against it.
  */
 async function previousAppRuntimeCanServe(
   dependencies: Pick<DeployAppImageDependencies, "checkTcpConnect">,
-  docker: Pick<DockerApiClient, "inspectContainer">,
+  docker: Pick<DockerApiClient, "inspectContainer" | "countContainerExits">,
   containerName: string,
   appPort: number,
   rollout: AppRolloutConfig
@@ -3356,6 +3411,7 @@ async function previousAppRuntimeCanServe(
   try {
     await waitForAppCandidateReadiness(dependencies, docker, containerName, appPort, rollout, {
       alreadyRunning: true,
+      subject: "Previous container",
     });
     return true;
   } catch (error) {
@@ -3431,7 +3487,7 @@ async function returnTrafficFromRejectedRelease(
     DeployAppImageDependencies,
     "checkTcpConnect" | "fetchImpl" | "writeLocalTraefikRoute"
   >,
-  docker: Pick<DockerApiClient, "inspectContainer" | "removeContainer">,
+  docker: Pick<DockerApiClient, "inspectContainer" | "countContainerExits" | "removeContainer">,
   input: {
     serviceId: string;
     hostnames: { providedHostname: string; customHostnames: string[] };
@@ -4806,10 +4862,13 @@ export async function handleDeleteVolume(docker: DockerApiClient, payload: Delet
  * Remove the per-project Docker network left behind when the last service in a project is deleted.
  *
  * The control plane only queues this once the project holds no services, volumes or buckets, so the
- * only endpoint still attached is Traefik, which every project network gets connected to on the
- * first app deploy. Docker refuses to delete a network with endpoints attached, so Traefik is
- * disconnected first; `disconnectNetwork` already tolerates the network or the container being
- * gone.
+ * only endpoint that can still be attached is Traefik, which joins a project network on the first app
+ * or database deploy. Docker refuses to delete a network with endpoints attached, so Traefik is
+ * disconnected first. Both steps are gated on what Docker reports: a project that never deployed
+ * anything has no network, one that only ran workers has a network Traefik never joined, and Docker
+ * 29 answers a disconnect in either case with a 500 rather than a 404. Attachment is read from the
+ * Traefik container rather than the network, because the network only lists running containers and
+ * a stopped Traefik still attached to a removed network can no longer start.
  *
  * The name is derived here rather than taken from the payload so it is produced by the same
  * function that created the network (`buildProjectNetwork`), which is the only definition of it.
@@ -4817,9 +4876,14 @@ export async function handleDeleteVolume(docker: DockerApiClient, payload: Delet
 export async function handleDeleteProject(docker: DockerApiClient, payload: DeleteProjectPayload) {
   const networkName = buildProjectNetwork(payload.projectId);
 
-  await docker.disconnectNetwork(networkName, TRAEFIK_CONTAINER_NAME, true);
-  await docker.removeNetwork(networkName);
-  await verifyNetworkAbsent(docker, networkName);
+  if (await docker.inspectNetwork(networkName)) {
+    const traefik = await docker.inspectContainer(TRAEFIK_CONTAINER_NAME);
+    if (traefik?.NetworkSettings?.Networks?.[networkName]) {
+      await docker.disconnectNetwork(networkName, TRAEFIK_CONTAINER_NAME, true);
+    }
+    await docker.removeNetwork(networkName);
+    await verifyNetworkAbsent(docker, networkName);
+  }
 
   return {
     networkName,

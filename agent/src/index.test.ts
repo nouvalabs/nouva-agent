@@ -419,6 +419,10 @@ function createDockerMock() {
           }
         : null
     ),
+    // Docker's event log records no exits unless a test says otherwise.
+    countContainerExits: mock(
+      async (_containerId: string, _sinceMs: number, _untilMs: number): Promise<number> => 0
+    ),
     listContainersUsingVolume: mock(async () => []),
     listContainersByLabels: mock(async () => []),
     inspectImage: mock(async () => ({ Id: "img_candidate" })),
@@ -834,6 +838,122 @@ describe("agent work mutation errors", () => {
       sanitizeAgentWorkResult(
         { rollout: { ...rollout, candidateContainerName: `nouva-${secret}` } },
         { ...customerVariables, SENTINEL_PRIVATE_NAME: secret }
+      )
+    ).toThrow("Agent work result conflicts with protected environment material");
+  });
+
+  test("redacts a worker's commands in place when they repeat a customer value", () => {
+    // Regression for #397: a worker whose image runs `node server.js --port 3000` could not report
+    // a finished deployment while the service had `PORT=3000`.
+    const secret = "sentinel-private-value";
+    const customerVariables = { PORT: "3000", SENTINEL_PRIVATE_NAME: secret };
+    const runtimeMetadata = {
+      image: "registry.example/worker:1",
+      containerName: "nouva-worker-svc_1-dep_1-0",
+      detectedEntrypoint: null,
+      detectedCommand: ["node", "server.js", "--port", "3000"],
+      detectedCommandDisplay: "node server.js --port 3000",
+      workerCommand: "node server.js --port 3000",
+      workerHealthCheckCommand: null,
+    };
+
+    expect(sanitizeAgentWorkResult({ runtimeMetadata }, customerVariables)).toEqual({
+      runtimeMetadata: {
+        ...runtimeMetadata,
+        detectedCommand: ["node", "server.js", "--port", "[REDACTED]"],
+        detectedCommandDisplay: "node server.js --port [REDACTED]",
+        workerCommand: "node server.js --port [REDACTED]",
+      },
+    });
+
+    // A secret in the same fields is redacted the same way and never reported.
+    const withSecret = sanitizeAgentWorkResult(
+      {
+        runtimeMetadata: {
+          ...runtimeMetadata,
+          detectedEntrypoint: [secret],
+          detectedCommand: ["node", "server.js", "--token", secret],
+          detectedCommandDisplay: `node server.js --token ${secret}`,
+          workerHealthCheckCommand: `curl -H 'x-key: ${secret}' localhost`,
+        },
+      },
+      customerVariables
+    );
+    expect(JSON.stringify(withSecret)).not.toContain(secret);
+    // An identifier beside them still refuses the result rather than reporting a corrupted one.
+    expect(() =>
+      sanitizeAgentWorkResult(
+        { runtimeMetadata: { ...runtimeMetadata, containerName: `nouva-${secret}` } },
+        customerVariables
+      )
+    ).toThrow("Agent work result conflicts with protected environment material");
+  });
+
+  test("redacts a build's detected language in place when a customer value repeats it", () => {
+    const secret = "sentinel-private-value";
+    const customerVariables = { NODE_VERSION: "22", RUNTIME: "node" };
+
+    expect(
+      sanitizeAgentWorkResult(
+        {
+          detectedLanguage: "node",
+          detectedFramework: "express",
+          languageVersion: "22",
+          internalPort: 3000,
+        },
+        customerVariables
+      )
+    ).toEqual({
+      detectedLanguage: "[REDACTED]",
+      detectedFramework: "express",
+      languageVersion: "[REDACTED]",
+      internalPort: 3000,
+    });
+    expect(
+      JSON.stringify(
+        sanitizeAgentWorkResult(
+          { detectedFramework: `express-${secret}` },
+          { SENTINEL_PRIVATE_NAME: secret }
+        )
+      )
+    ).not.toContain(secret);
+  });
+
+  test("keeps protocol field names when a customer value equals or contains one", () => {
+    // Regression for #397: `MODE=strategy` redacted the rollout's `strategy` key itself, and
+    // `SOURCE=image` the `imageStoreMode` key, so the agent refused its own result.
+    const rollout = {
+      strategy: "candidate_ready_cutover",
+      outcome: "committed",
+      currentPhase: "retire",
+      liveRuntimePreserved: false,
+      rollbackCompleted: false,
+      activeContainerName: "nouva-app-svc_1-dep_1",
+    };
+    const runtimeMetadata = {
+      containerName: "nouva-app-svc_1-dep_1",
+      image: "registry.example/app:1",
+      imageStoreMode: "docker-local",
+      internalPort: 3000,
+    };
+    const customerVariables = { MODE: "strategy", SOURCE: "image" };
+
+    expect(sanitizeAgentWorkResult({ rollout, runtimeMetadata }, customerVariables)).toEqual({
+      rollout,
+      runtimeMetadata,
+    });
+
+    // The same values are still protected wherever they are a value.
+    expect(() =>
+      sanitizeAgentWorkResult(
+        { rollout: { ...rollout, activeContainerName: "nouva-strategy-1" } },
+        customerVariables
+      )
+    ).toThrow("Agent work result conflicts with protected environment material");
+    expect(() =>
+      sanitizeAgentWorkResult(
+        { runtimeMetadata: { ...runtimeMetadata, image: "registry.example/image:1" } },
+        customerVariables
       )
     ).toThrow("Agent work result conflicts with protected environment material");
   });
@@ -4258,6 +4378,8 @@ describe("deployAppImageWithDependencies", () => {
     State: { Running: true, Status: "running", ExitCode: 0, OOMKilled: history.OOMKilled },
     NetworkSettings: { Networks: { "nouva-local": { IPAddress: "172.19.0.9" } } },
   });
+  const RECENT_EXIT_WINDOW_MS = 5 * 60_000;
+  const DAY_MS = 24 * 60 * 60_000;
 
   test.each([
     [
@@ -4270,6 +4392,7 @@ describe("deployAppImageWithDependencies", () => {
         State: { Running: false, Status: "restarting", ExitCode: 1, OOMKilled: false },
       }),
       "keeps restarting",
+      [],
     ],
     [
       "is waiting to be restarted after a memory kill",
@@ -4284,26 +4407,91 @@ describe("deployAppImageWithDependencies", () => {
             }
           : servingLive({ RestartCount: 4, OOMKilled: true })(),
       "ran out of memory",
+      [],
+    ],
+    [
+      "keeps crashing after serving briefly",
+      // Up and reachable between crashes: Docker restarts a process that ran for over ten seconds
+      // after only 100 ms, so the check finds it up almost every time.
+      servingLive({ RestartCount: 6, OOMKilled: false }),
+      "Previous container nouva-app-svc_1-live keeps restarting (3 restarts)",
+      [15_000, 35_000, 55_000],
+    ],
+    [
+      "restarted once moments ago",
+      servingLive({ RestartCount: 1, OOMKilled: false }),
+      null,
+      [15_000],
+    ],
+    [
+      "crashed once last week and once moments ago",
+      servingLive({ RestartCount: 2, OOMKilled: false }),
+      null,
+      [15_000, 7 * DAY_MS],
+    ],
+    [
+      "crashed twice, the first time just before the window",
+      servingLive({ RestartCount: 2, OOMKilled: false }),
+      null,
+      [15_000, RECENT_EXIT_WINDOW_MS + 10_000],
+    ],
+    [
+      "crashed twice, the first time just inside the window",
+      servingLive({ RestartCount: 2, OOMKilled: false }),
+      "keeps restarting (2 restarts)",
+      [15_000, RECENT_EXIT_WINDOW_MS - 10_000],
+    ],
+    [
+      // The start by hand after each stop clears Docker's restart count.
+      "was stopped and started by hand twice moments ago",
+      servingLive({ RestartCount: 0, OOMKilled: false }),
+      null,
+      [15_000, 45_000],
+    ],
+    [
+      // The stop by hand 45 s ago logged an exit, but its start cleared the restart count.
+      "was stopped and started by hand, then crashed once",
+      servingLive({ RestartCount: 1, OOMKilled: false }),
+      null,
+      [15_000, 45_000],
+    ],
+    [
+      // An unreadable event log is no evidence against it: judged by what the check sees, it serves.
+      "keeps crashing while Docker's event log cannot be read",
+      servingLive({ RestartCount: 6, OOMKilled: false }),
+      null,
+      new Error("Docker API timed out"),
     ],
     [
       "recovered from restarts long before this deploy",
       servingLive({ RestartCount: 2, OOMKilled: false }),
       null,
+      [14 * DAY_MS, 15 * DAY_MS],
     ],
     [
       "outlived a process killed for memory before this deploy",
       servingLive({ RestartCount: 0, OOMKilled: true }),
       null,
+      [],
     ],
     [
       "was restarted after a memory kill before this deploy",
       servingLive({ RestartCount: 1, OOMKilled: true }),
       null,
+      [],
     ],
-  ])("after a failed cutover, reports whether a previous container that %s serves", async (_history, inspectLive, refusal) => {
+  ])("after a failed cutover, reports whether a previous container that %s serves", async (_history, inspectLive, refusal, exitLog) => {
     const consoleWarn = spyOn(console, "warn").mockImplementation(() => {});
     const docker = createDockerMock();
     docker.ensureContainer.mockImplementation(async () => "ctr_candidate");
+    // Docker's event log: the live container's exits, `exitLog` milliseconds ago.
+    docker.countContainerExits.mockImplementation(async (containerId, sinceMs, untilMs) => {
+      if (exitLog instanceof Error) throw exitLog;
+      const now = Date.now();
+      return containerId === "ctr_live"
+        ? exitLog.filter((msAgo) => now - msAgo >= sinceMs && now - msAgo <= untilMs).length
+        : 0;
+    });
     let liveInspections = 0;
     docker.inspectContainer.mockImplementation(async (name: string) => {
       if (name === "nouva-app-svc_1-live") {
@@ -5889,20 +6077,81 @@ describe("verified volume cleanup", () => {
 // project left a `nouva-project-<hash>` behind on the customer's server for good.
 describe("verified project network cleanup", () => {
   const PROJECT_NETWORK = `nouva-project-${hashProjectNetwork("proj_1")}`;
+  const PROOF = {
+    version: 1,
+    kind: "delete_project",
+    network: { name: PROJECT_NETWORK, absent: true },
+  };
+
+  function traefikInspection(networks: string[], running = true) {
+    return {
+      Id: "traefik_1",
+      Name: "/nouva-traefik",
+      State: { Running: running, Status: running ? "running" : "exited" },
+      NetworkSettings: { Networks: Object.fromEntries(networks.map((name) => [name, {}])) },
+    };
+  }
 
   test("detaches Traefik, removes the network, and proves it is gone", async () => {
+    const docker = createDockerMock();
+    docker.inspectNetwork.mockResolvedValueOnce({ Name: PROJECT_NETWORK });
+    docker.inspectContainer.mockResolvedValueOnce(
+      traefikInspection(["nouva-local", PROJECT_NETWORK])
+    );
+
+    const result = await handleDeleteProject(docker as never, { projectId: "proj_1" });
+
+    expect(docker.inspectContainer).toHaveBeenCalledWith("nouva-traefik");
+    expect(docker.disconnectNetwork).toHaveBeenCalledWith(PROJECT_NETWORK, "nouva-traefik", true);
+    expect(docker.removeNetwork).toHaveBeenCalledWith(PROJECT_NETWORK);
+    expect(docker.disconnectNetwork.mock.invocationCallOrder[0]).toBeLessThan(
+      docker.removeNetwork.mock.invocationCallOrder[0]!
+    );
+    expect(docker.inspectNetwork).toHaveBeenCalledTimes(2);
+    expect(result.cleanupProof).toEqual(PROOF);
+  });
+
+  // #434: an empty project never creates its network, and Docker 29 answers a force disconnect
+  // from a missing network with a 500, so the delete failed on every retry.
+  test("skips disconnect and removal when the project never created a network", async () => {
     const docker = createDockerMock();
 
     const result = await handleDeleteProject(docker as never, { projectId: "proj_1" });
 
+    expect(docker.inspectNetwork).toHaveBeenCalledWith(PROJECT_NETWORK);
+    expect(docker.disconnectNetwork).not.toHaveBeenCalled();
+    expect(docker.removeNetwork).not.toHaveBeenCalled();
+    expect(result.cleanupProof).toEqual(PROOF);
+  });
+
+  // Docker 29 also answers a disconnect of a container that is not on an existing network with a
+  // 500, which is the case for a project that only ever ran workers.
+  test.each([
+    ["Traefik is on other networks only", traefikInspection(["nouva-local"])],
+    ["Traefik does not exist", null],
+  ])("removes the network without a disconnect when %s", async (_case, traefik) => {
+    const docker = createDockerMock();
+    docker.inspectNetwork.mockResolvedValueOnce({ Name: PROJECT_NETWORK });
+    docker.inspectContainer.mockResolvedValueOnce(traefik);
+
+    const result = await handleDeleteProject(docker as never, { projectId: "proj_1" });
+
+    expect(docker.disconnectNetwork).not.toHaveBeenCalled();
+    expect(docker.removeNetwork).toHaveBeenCalledWith(PROJECT_NETWORK);
+    expect(result.cleanupProof).toEqual(PROOF);
+  });
+
+  // The network only lists running containers, but a stopped Traefik keeps the attachment and could
+  // not start again once the network is removed underneath it.
+  test("detaches a stopped Traefik that the network no longer lists", async () => {
+    const docker = createDockerMock();
+    docker.inspectNetwork.mockResolvedValueOnce({ Name: PROJECT_NETWORK, Containers: {} });
+    docker.inspectContainer.mockResolvedValueOnce(traefikInspection([PROJECT_NETWORK], false));
+
+    await handleDeleteProject(docker as never, { projectId: "proj_1" });
+
     expect(docker.disconnectNetwork).toHaveBeenCalledWith(PROJECT_NETWORK, "nouva-traefik", true);
     expect(docker.removeNetwork).toHaveBeenCalledWith(PROJECT_NETWORK);
-    expect(docker.inspectNetwork).toHaveBeenCalledWith(PROJECT_NETWORK);
-    expect(result.cleanupProof).toEqual({
-      version: 1,
-      kind: "delete_project",
-      network: { name: PROJECT_NETWORK, absent: true },
-    });
   });
 
   // The name must come from the same derivation that created the network, not from the payload.
@@ -5917,7 +6166,7 @@ describe("verified project network cleanup", () => {
 
   test("does not emit proof when Docker still reports the network", async () => {
     const docker = createDockerMock();
-    docker.inspectNetwork.mockResolvedValueOnce({ Name: PROJECT_NETWORK });
+    docker.inspectNetwork.mockResolvedValue({ Name: PROJECT_NETWORK });
 
     await expect(handleDeleteProject(docker as never, { projectId: "proj_1" })).rejects.toThrow(
       "still exists after cleanup"
@@ -5934,12 +6183,13 @@ describe("verified project network cleanup", () => {
       `/v1.51/networks/${PROJECT_NETWORK}`,
       "network has active endpoints"
     );
+    docker.inspectNetwork.mockResolvedValueOnce({ Name: PROJECT_NETWORK });
     docker.removeNetwork.mockRejectedValueOnce(conflict);
 
     await expect(handleDeleteProject(docker as never, { projectId: "proj_1" })).rejects.toBe(
       conflict
     );
-    expect(docker.inspectNetwork).not.toHaveBeenCalled();
+    expect(docker.inspectNetwork).toHaveBeenCalledTimes(1);
   });
 });
 

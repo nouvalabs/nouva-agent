@@ -12,7 +12,8 @@ export interface CandidateRuntimeEvidence {
   /**
    * Automatic restarts the restart policy performed. Docker clears this counter whenever a
    * container is started by hand, so it only ever covers the supervision window readiness observes:
-   * a fresh candidate, or a live container the rollback path just started again.
+   * a fresh candidate, or a live container the rollback path just started again. A live container
+   * that kept running also counts the restarts it had moments before the window (`recentRestarts`).
    */
   readonly restarts: number;
   readonly exitCode: number | null;
@@ -105,18 +106,19 @@ function mergeExitCode(previous: number | null, reported: number | null): number
 /**
  * Whether this inspection shows the container killed for memory. Without `outOfMemoryAtStart` the
  * flag counts as reported. With it, the flag may describe a kill the container survived, so it only
- * counts when the container was not found up with it at the start and is seen going down with it.
+ * counts when the container was not found up with it at the start and is seen going down with it:
+ * restarts from before this supervision window do not show that.
  */
 function readOutOfMemory(
   inspection: DockerContainerInspection,
-  restarts: number,
+  observedRestarts: number,
   outOfMemoryAtStart: boolean | undefined
 ): boolean {
   const state = inspection.State;
   if (state?.OOMKilled !== true) return false;
   if (outOfMemoryAtStart === undefined) return true;
   const wentDown =
-    restarts > 0 || state.Running !== true || state.Status?.toLowerCase() === "restarting";
+    observedRestarts > 0 || state.Running !== true || state.Status?.toLowerCase() === "restarting";
   return !outOfMemoryAtStart && wentDown;
 }
 
@@ -124,12 +126,18 @@ function recordEvidence(
   previous: CandidateRuntimeEvidence,
   inspection: DockerContainerInspection,
   restartBaseline: number,
+  recentRestarts: number,
   outOfMemoryAtStart: boolean | undefined
 ): CandidateRuntimeEvidence {
   const reportedRestarts = readNonNegativeInteger(inspection.RestartCount) ?? 0;
-  const restarts = Math.max(previous.restarts, Math.max(0, reportedRestarts - restartBaseline));
+  const restarts = Math.max(
+    previous.restarts,
+    recentRestarts + Math.max(0, reportedRestarts - restartBaseline)
+  );
   return {
-    outOfMemory: previous.outOfMemory || readOutOfMemory(inspection, restarts, outOfMemoryAtStart),
+    outOfMemory:
+      previous.outOfMemory ||
+      readOutOfMemory(inspection, restarts - recentRestarts, outOfMemoryAtStart),
     restarts,
     exitCode: mergeExitCode(previous.exitCode, readReportedExitCode(inspection.State)),
     memoryLimitBytes:
@@ -239,6 +247,12 @@ export function assessCandidateReadiness(input: {
    */
   restartBaseline?: number;
   /**
+   * Of the restarts in `restartBaseline`, how many happened moments before this supervision window
+   * began. They still count toward a restart loop: a release that serves for a while between
+   * crashes is up for most of its loop, so this window alone rarely sees it go down.
+   */
+  recentRestarts?: number;
+  /**
    * For a container that was already running when this supervision window began: whether its
    * first inspection found it up with Docker's `OOMKilled` flag set, a memory kill it survived.
    * Such a flag says nothing about whether it serves: Docker 24 and later raise it when any
@@ -253,6 +267,7 @@ export function assessCandidateReadiness(input: {
     input.evidence,
     input.inspection,
     input.restartBaseline ?? 0,
+    input.recentRestarts ?? 0,
     input.outOfMemoryAtStart
   );
   const { containerName } = input;

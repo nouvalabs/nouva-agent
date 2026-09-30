@@ -58,11 +58,22 @@ export interface LogRedactionOptions {
   operationalValues?: readonly string[];
   /**
    * Which of the redacted values the platform generated rather than the customer typing them.
-   * These stay redacted; the provenance only relaxes a *word* among them to whole-lexeme matching,
-   * so a fixed literal such as `require` stops eating the word inside `requirements.txt` (#219).
-   * A value not listed here is treated as the customer's and matched strictly.
+   * The provenance never unmasks a credential. It relaxes a *word* among them to whole-lexeme
+   * matching, so a fixed literal such as `require` stops eating the word inside
+   * `requirements.txt` (#219), and it leaves a port number out altogether, because `PGPORT=5432`
+   * is an address rather than a secret (#398). A value not listed here is treated as the
+   * customer's and matched strictly.
    */
   platformGeneratedValues?: readonly string[];
+  /**
+   * Leave the property names of plain objects as they are and redact only what they hold. For a
+   * structure whose names are the platform's own field names, such as an agent protocol field
+   * (`rollout.strategy`, `runtimeMetadata.imageStoreMode`): a customer value that equals or
+   * contains one of those names is not coming back through it, and redacting the name corrupted
+   * the field and refused the result (#397). A value under a sensitive-looking name is still
+   * replaced whole.
+   */
+  preserveObjectKeys?: boolean;
   secretValues?: readonly string[];
 }
 
@@ -160,6 +171,13 @@ const MAX_WORD_TOKEN_LENGTH = 12;
 
 /** One run of letters with no internal case change: `require`, `Require`, `ADMIN`. */
 const WORD_TOKEN_PATTERN = /^(?:[A-Za-z][a-z]*|[A-Z]+)$/;
+
+/** A TCP port number as the platform writes one: `5432`, never `05432`. */
+const PORT_NUMBER_PATTERN = /^[1-9]\d{0,4}$/;
+
+function isPortNumber(value: string): boolean {
+  return PORT_NUMBER_PATTERN.test(value) && Number(value) <= 65_535;
+}
 
 /**
  * Who put a redaction token into the map.
@@ -522,6 +540,52 @@ export function collectAgentRolloutVocabularyFields(
   return fields;
 }
 
+/** Top-level agent result fields that only describe what a build detected. */
+const AGENT_RESULT_DESCRIPTIVE_KEYS: ReadonlySet<string> = new Set([
+  "detectedFramework",
+  "detectedLanguage",
+  "languageVersion",
+]);
+
+/** `runtimeMetadata` fields that only describe the commands a worker's image or settings run. */
+const AGENT_RUNTIME_METADATA_DESCRIPTIVE_KEYS = [
+  "detectedCommand",
+  "detectedCommandDisplay",
+  "detectedEntrypoint",
+  "workerCommand",
+  "workerHealthCheckCommand",
+] as const;
+
+const AGENT_RESULT_DESCRIPTIVE_MASK = "[DESCRIPTIVE]";
+
+/**
+ * One agent result field as the leak check compares it: the parts that only describe what the agent
+ * found or ran — the language a build detected, the command a worker's image declares or its
+ * settings configure — are masked out, so a redaction inside them is not a conflict.
+ *
+ * They come from the customer's own source and settings, so a customer value inside one is expected
+ * rather than a leak: `PORT=3000` in `node server.js --port 3000`, `NODE_VERSION=22` in the
+ * detected version. Nothing reads them back, so both ends of the agent protocol redact them in
+ * place and report them, the way they treat a status message, instead of refusing the result of a
+ * deployment whose containers are already running (#397). They are still redacted: a secret inside
+ * one is never reported, it just no longer rejects the fields beside it.
+ */
+export function maskAgentResultDescriptiveFields(key: string, value: unknown): unknown {
+  if (AGENT_RESULT_DESCRIPTIVE_KEYS.has(key)) {
+    return AGENT_RESULT_DESCRIPTIVE_MASK;
+  }
+  if (key !== "runtimeMetadata" || !isRecord(value) || Array.isArray(value)) {
+    return value;
+  }
+  const masked: Record<string, unknown> = { ...value };
+  for (const descriptiveKey of AGENT_RUNTIME_METADATA_DESCRIPTIVE_KEYS) {
+    if (Object.hasOwn(masked, descriptiveKey)) {
+      masked[descriptiveKey] = AGENT_RESULT_DESCRIPTIVE_MASK;
+    }
+  }
+  return masked;
+}
+
 function resolveOperationalValueExclusions(options: LogRedactionOptions): Set<string> {
   const exclusions = new Set<string>();
   for (const value of options.operationalValues ?? []) {
@@ -530,6 +594,13 @@ function resolveOperationalValueExclusions(options: LogRedactionOptions): Set<st
     }
     exclusions.add(value);
     exclusions.add(encodeURIComponent(value));
+  }
+  // A port the platform assigned is an address, not a credential. Masking it hid which port a build
+  // connected to and cut `[REDACTED]` into every longer number that contained it (#398).
+  for (const value of options.platformGeneratedValues ?? []) {
+    if (isPortNumber(value)) {
+      exclusions.add(value);
+    }
   }
   return exclusions;
 }
@@ -585,6 +656,7 @@ type LiteralSecretMatcher = readonly LiteralSecretMatcherNode[];
 type CompiledLogRedaction = {
   boundaryTextValues: readonly string[];
   exactStructuredValues: ReadonlySet<string>;
+  preserveObjectKeys: boolean;
   substringMatcher: LiteralSecretMatcher;
 };
 
@@ -655,6 +727,7 @@ function compileLogRedaction(options: LogRedactionOptions): CompiledLogRedaction
   return {
     boundaryTextValues: boundary,
     exactStructuredValues: new Set(resolveExactStructuredValues(options)),
+    preserveObjectKeys: options.preserveObjectKeys === true,
     substringMatcher: createLiteralSecretMatcher(substring),
   };
 }
@@ -920,7 +993,7 @@ function sanitizeObjectValue(
 
   const result: Record<string, unknown> = {};
   for (const [key, entry] of safeObjectEntries(value as Record<string, unknown>)) {
-    const safeKey = sanitizeStructuredText(key, redaction);
+    const safeKey = redaction.preserveObjectKeys ? key : sanitizeStructuredText(key, redaction);
     result[safeKey] = isSensitiveLogKey(key)
       ? REDACTED_LOG_VALUE
       : sanitizeValue(entry, redaction, seen);

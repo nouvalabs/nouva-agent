@@ -52,6 +52,27 @@ describe("createBuildLogRedactor", () => {
 
     expect(redact("tried changemenow")).toBe("tried [REDACTED]now");
   });
+
+  test("keeps a port the platform generated", () => {
+    // #398: `PGPORT=5432` comes from the referenced database's generated catalog.
+    const redact = createBuildLogRedactor({ ...buildEnvVars, PGPORT: "5432" }, [
+      "require",
+      "nouva_suite_db",
+      "5432",
+    ]);
+
+    expect(redact("added 154321 packages, waiting for db.internal:5432")).toBe(
+      "added 154321 packages, waiting for db.internal:5432"
+    );
+    expect(redact("prefixzzsecretvaluezzsuffix")).toBe("prefix[REDACTED]suffix");
+    expect(redact(buildEnvVars.DATABASE_URL)).toBe("[REDACTED]");
+  });
+
+  test("masks a port-shaped value the platform did not generate", () => {
+    const redact = createBuildLogRedactor({ PGPORT: "5432", PIN_CODE: "6379" }, ["5432"]);
+
+    expect(redact("pin 6379, build 163790")).toBe("pin [REDACTED], build 1[REDACTED]0");
+  });
 });
 
 describe("redactSensitiveText", () => {

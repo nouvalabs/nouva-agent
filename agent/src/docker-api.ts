@@ -718,6 +718,34 @@ export class DockerApiClient {
     }
   }
 
+  /**
+   * How many times the container's process exited between two instants, read from Docker's event
+   * log. Docker keeps only its latest few hundred events across all containers and event types
+   * (health checks alone log three each), so on a busy host the log may not reach back to `sinceMs`:
+   * the count can then fall short, but never exceeds the exits that happened.
+   */
+  async countContainerExits(
+    containerId: string,
+    sinceMs: number,
+    untilMs: number
+  ): Promise<number> {
+    const params = new URLSearchParams({
+      since: (sinceMs / 1000).toFixed(3),
+      // An `until` already past makes Docker answer with the logged events instead of streaming.
+      until: (untilMs / 1000).toFixed(3),
+      filters: JSON.stringify({ type: ["container"], container: [containerId], event: ["die"] }),
+    });
+    const raw = await this.requestRaw("GET", `/events?${params.toString()}`, null, 10_000);
+    return raw
+      .toString("utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .filter((line) => {
+        const event = JSON.parse(line) as { Action?: unknown; status?: unknown };
+        return event.Action === "die" || event.status === "die";
+      }).length;
+  }
+
   async listContainersUsingVolume(volumeName: string): Promise<DockerContainerInspection[]> {
     const filters = encodeURIComponent(JSON.stringify({ volume: [volumeName] }));
     const containers = await this.request<Array<{ Id?: string }>>(

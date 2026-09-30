@@ -544,3 +544,40 @@ describe("DockerApiClient cleanup semantics", () => {
     requestSpy.mockRestore();
   });
 });
+
+describe("DockerApiClient.countContainerExits", () => {
+  test("counts the container's logged exits between two instants", async () => {
+    const DockerApiClientCtor = DockerApiClient as unknown as {
+      new (apiVersion: string): DockerApiClient;
+    };
+    const client = new DockerApiClientCtor("v1.51");
+    const exit = (time: number) =>
+      JSON.stringify({ Type: "container", Action: "die", Actor: { ID: "ctr_live" }, time });
+    const requestSpy = spyOn(client, "requestRaw").mockResolvedValue(
+      Buffer.from(`${exit(1_790_725_451)}\n${exit(1_790_725_463)}\n`)
+    );
+
+    await expect(
+      client.countContainerExits("ctr_live", 1_790_725_200_000, 1_790_725_500_250)
+    ).resolves.toBe(2);
+
+    const [method, path, body, timeoutMs] = requestSpy.mock.calls[0] ?? [];
+    const query = new URL(`http://docker${path}`).searchParams;
+    expect([method, body, timeoutMs]).toEqual(["GET", null, 10_000]);
+    expect(path?.startsWith("/events?")).toBe(true);
+    expect(query.get("since")).toBe("1790725200.000");
+    expect(query.get("until")).toBe("1790725500.250");
+    expect(JSON.parse(query.get("filters") ?? "")).toEqual({
+      type: ["container"],
+      container: ["ctr_live"],
+      event: ["die"],
+    });
+
+    requestSpy.mockResolvedValue(Buffer.from(""));
+    await expect(
+      client.countContainerExits("ctr_live", 1_790_725_200_000, 1_790_725_500_250)
+    ).resolves.toBe(0);
+
+    requestSpy.mockRestore();
+  });
+});
